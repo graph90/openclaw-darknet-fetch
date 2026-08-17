@@ -68,11 +68,6 @@ python3 openclaw_darknet_fetch.py \
 python3 openclaw_darknet_fetch.py \
     -i http://i2p-projekt.i2p/
 ```
-```bash
-python3 openclaw_darknet_fetch.py \
-    -t http://exampleonion.onion/ \
-    --json
-```
 ---
 
 I2P Note:
