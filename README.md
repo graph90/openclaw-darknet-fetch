@@ -66,7 +66,7 @@ python3 openclaw_darknet_fetch.py \
 ```
 ```bash
 python3 openclaw_darknet_fetch.py \
-    -i http://example.i2p/
+    -i http://i2p-projekt.i2p/
 ```
 ```bash
 python3 openclaw_darknet_fetch.py \
