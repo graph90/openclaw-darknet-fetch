@@ -18,7 +18,7 @@ Tor -> normal clearnet:
     python3 openclaw_darknet_fetch.py -t https://example.com
 
 I2P:
-    python3 openclaw_darknet_fetch.py -i http://example.i2p/
+    python3 openclaw_darknet_fetch.py -i http://i2p-projekt.i2p/
 
 
 PROXIES
