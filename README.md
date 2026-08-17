@@ -35,13 +35,11 @@ Python 3.
 Install the dependency:
 pip install requests[socks]
 
-Tor
-A local Tor SOCKS5 proxy should be available at:
-127.0.0.1:9050
+Tor:
+    A local Tor SOCKS5 proxy should be available at: 127.0.0.1:9050
 
-I2P
-A local I2P HTTP proxy should be available at:
-127.0.0.1:4444
+I2P:
+    A local I2P HTTP proxy should be available at: 127.0.0.1:4444
 
 ---
 ## Network Modes
