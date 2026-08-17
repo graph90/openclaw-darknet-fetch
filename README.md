@@ -58,8 +58,7 @@ python3 openclaw_darknet_fetch.py \
 ```
 
 ```bash
-python3 openclaw_darknet_fetch.py \
-    -t http://exampleonion.onion/
+python3 openclaw_darknet_fetch.py -t "http://duckduckgogg42xjoc72x3sjasowoarfbgcmvfimaftt6twagswzczad.onion/" --json
 ```
 ```bash
 python3 openclaw_darknet_fetch.py \
