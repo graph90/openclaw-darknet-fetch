@@ -75,7 +75,8 @@ python3 openclaw_darknet_fetch.py \
 ```
 ---
 
-I2P Discovery Note
+I2P Note:
+
 This project is a fetcher, not an I2P discovery service.
 The agent needs an actual I2P hostname/destination that the local I2P router can resolve.
 
