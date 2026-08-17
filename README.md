@@ -77,38 +77,6 @@ python3 openclaw_darknet_fetch.py \
 
 I2P Discovery Note
 This project is a fetcher, not an I2P discovery service.
-
 The agent needs an actual I2P hostname/destination that the local I2P router can resolve.
 
 ---
-
-How It Fits With OpenClaw
-
-The intended workflow is:
-                    OpenClaw
-                       |
-                       v
-          openclaw_darknet_fetch.py
-                       |
-          +------------+------------+
-          |            |            |
-          v            v            v
-       Normal         Tor          I2P
-          |           |             |
-       Internet     :9050         :4444
-                      |             |
-                   .onion         .i2p
-        
-Why I Built This
-I wanted to experiment with what a local AI agent could do when given access to multiple network transports.
-A normal web-enabled agent can already fetch Internet resources.
-This project adds another layer:
-Normal Internet
-       +
-     Tor
-       +
-     I2P
-       ↓
-  Local AI Agent
-The project started as a small Python experiment and evolved into a single fetcher so OpenClaw doesn't need separate tools for Tor and I2P.
-The focus is deliberately on keeping the tool small, predictable, and easy for an agent to invoke.
