@@ -12,7 +12,7 @@ Normal clearnet:
     python3 openclaw_darknet_fetch.py -n https://example.com
 
 Tor / onion:
-    python3 openclaw_darknet_fetch.py -t http://duckduckgogg42xjoc72x3sjasowoarfbgcmvfimaftt6twagswzczad.onion/"
+    python3 openclaw_darknet_fetch.py -t http://duckduckgogg42xjoc72x3sjasowoarfbgcmvfimaftt6twagswzczad.onion/
 
 Tor -> normal clearnet:
     python3 openclaw_darknet_fetch.py -t https://example.com
