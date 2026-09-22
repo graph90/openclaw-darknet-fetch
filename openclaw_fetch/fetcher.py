@@ -11,6 +11,7 @@ network for a target, non-string URL).
 import json
 import os
 import random
+import re
 import socket
 import threading
 import time
@@ -24,6 +25,7 @@ from .cache import TtlCache, has_cookies
 from .errors import FetchError, error_result, exit_code_for
 from .parse import parse_document
 from .result import Result
+from .util import estimate_tokens, host_of, public_ip_addresses
 
 NETWORKS = ("normal", "tor", "i2p")
 NETWORK_LABEL = {"normal": "NORMAL", "tor": "TOR", "i2p": "I2P"}
@@ -182,10 +184,96 @@ class _CookieStore:
                 raise
 
 
+class _RateLimiter:
+    """Token-bucket rate limiter (per Fetcher; shared across its workers)."""
+
+    def __init__(self, rps, max_burst=None):
+        self.rps = max(0.0, float(rps))
+        self.max_burst = max_burst or max(1, int(self.rps) if self.rps else 1)
+        self._tokens = float(self.max_burst)
+        self._updated = time.monotonic()
+        self._lock = threading.Lock()
+
+    def wait(self):
+        if self.rps <= 0:
+            return
+        while True:
+            with self._lock:
+                now = time.monotonic()
+                self._tokens = min(
+                    self.max_burst,
+                    self._tokens + (now - self._updated) * self.rps,
+                )
+                self._updated = now
+                if self._tokens >= 1.0:
+                    self._tokens -= 1.0
+                    return
+                wait = (1.0 - self._tokens) / self.rps
+            time.sleep(wait)
+
+
 def _mkstemp(directory):
     import tempfile
 
     return tempfile.mkstemp(prefix=".ocf-cookies-", suffix=".tmp", dir=directory)
+
+
+class _RobotsGuard:
+    """Minimal robots.txt checker with per-host caching (single pass)."""
+
+    def __init__(self, fetcher):
+        self.fetcher = fetcher
+        self._cache = {}
+        self._lock = threading.Lock()
+
+    def allowed(self, url):
+        from urllib.parse import urlsplit
+
+        parts = urlsplit(url)
+        origin = "%s://%s" % (parts.scheme, parts.netloc)
+        with self._lock:
+            rules = self._cache.get(origin)
+        if rules is None:
+            rules = self._fetch(origin, parts.scheme, parts.netloc)
+            with self._lock:
+                self._cache[origin] = rules
+        path = parts.path or "/"
+        if not rules or rules == "*":
+            return True
+        for disallowed in rules:
+            if disallowed == "*" or path.startswith(disallowed):
+                return False
+        return True
+
+    def _fetch(self, origin, scheme, netloc):
+        resp = self.fetcher.fetch(
+            "%s://%s/robots.txt" % (scheme, netloc),
+            allow_errors=True,
+            keep_raw=True,
+            _skip_guards=True,
+        )
+        raw = resp.get("_raw_body") or resp.get("text") or ""
+        if not resp.ok and resp.get("status") not in (404, 401, 403):
+            return "*"  # robots unreachable -> allow (never hard-block)
+        return _parse_robots(raw)
+
+
+def _parse_robots(text):
+    disallowed = []
+    in_ours = False
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        low = line.lower()
+        if low.startswith("user-agent"):
+            agent = line.split(":", 1)[1].strip() if ":" in line else ""
+            in_ours = agent == "*" or agent.lower() == "openclawdarknetfetch"
+        elif low.startswith("disallow") and in_ours:
+            val = line.split(":", 1)[1].strip() if ":" in line else ""
+            if val:
+                disallowed.append(val)
+    return [d for d in disallowed if d != ""]
 
 
 class Fetcher:
@@ -213,6 +301,9 @@ class Fetcher:
         allow_errors=False,
         max_redirects=None,
         respect_robots=False,
+        rate_limit=None,
+        no_private_ip=False,
+        expect=None,
     ):
         opts = config.resolve({})
         self.network = _normalize_network(network)
@@ -229,6 +320,11 @@ class Fetcher:
         self.max_redirects = max_redirects if max_redirects is not None else opts.get("max_redirects", config.DEFAULT_MAX_REDIRECTS)
         self.allow_errors = allow_errors
         self.respect_robots = respect_robots
+        self.rate_limit = rate_limit
+        self.no_private_ip = bool(no_private_ip)
+        self.expect = expect
+        self._rate = _RateLimiter(rate_limit) if rate_limit else None
+        self._robots = _RobotsGuard(self) if respect_robots else None
         self.ua = ua or opts.get("ua") or config.DEFAULT_UA
         self.headers = dict(headers or {})
         self.headers.setdefault("User-Agent", self.ua)
@@ -276,6 +372,8 @@ class Fetcher:
     def _request(self, method, url, **request_kw):
         """Run the request with retries. Returns (response, error) tuple."""
         session = self._session()
+        if self._rate is not None:
+            self._rate.wait()
         attempts = self.retries + 1
         last_error = None
         last_response = None
@@ -369,7 +467,8 @@ class Fetcher:
         return body, text, None
 
     # -- public API -------------------------------------------------------
-    def fetch(self, url, method="GET", *, data=None, form=True, headers=None, allow_errors=None, keep_raw=False):
+    def fetch(self, url, method="GET", *, data=None, form=True, headers=None, allow_errors=None, keep_raw=False,
+              _skip_guards=False):
         """Fetch one URL and return a result dict (never raises for runtime errors)."""
         t0 = time.monotonic()
         eff_allow_errors = self.allow_errors if allow_errors is None else allow_errors
@@ -386,6 +485,36 @@ class Fetcher:
             result = error_result(code, message, requested_url=clean_url, network=NETWORK_LABEL[self.network])
             result["took_ms"] = int((time.monotonic() - t0) * 1000)
             return result
+
+        # -- safety guards -------------------------------------------------
+        if not _skip_guards:
+            if self.no_private_ip and self.network == "normal":
+                host = host_of(clean_url)
+                if host:
+                    _, is_private, err = public_ip_addresses(host)
+                    if err:
+                        result = error_result(
+                            "HOST_BLOCKED", "cannot resolve %r: %s" % (host, err),
+                            requested_url=clean_url, network=NETWORK_LABEL[self.network],
+                        )
+                        result["took_ms"] = int((time.monotonic() - t0) * 1000)
+                        return result
+                    if is_private:
+                        result = error_result(
+                            "HOST_BLOCKED",
+                            "target %r resolves to a private/loopback address (use --no-private-ip only for public targets)" % host,
+                            requested_url=clean_url, network=NETWORK_LABEL[self.network],
+                        )
+                        result["took_ms"] = int((time.monotonic() - t0) * 1000)
+                        return result
+        if not _skip_guards and self._robots is not None and method == "GET" and not data:
+            if not self._robots.allowed(clean_url):
+                result = error_result(
+                    "ROBOTS_BLOCKED", "blocked by robots.txt", requested_url=clean_url,
+                    network=NETWORK_LABEL[self.network],
+                )
+                result["took_ms"] = int((time.monotonic() - t0) * 1000)
+                return result
 
         use_cache = self._cache_safe and method == "GET" and not data
         if use_cache:
@@ -430,15 +559,20 @@ class Fetcher:
             final_url=final_url,
             source_len=len(body),
             max_links=self.max_links,
+            raw_body=body,
         )
         rendered_text = _truncate(kind["text"], self.max_chars, "text")
         rendered_markdown = _truncate(kind["markdown"], self.max_chars, "text")
         if kind["kind"] in ("pdf", "image") and not kind["text"]:
             rendered_text = kind["text"]
+
+        expect_error = self._expect_check(kind["kind"])
+        if expect_error and not eff_allow_errors:
+            ok = False
         result = Result(
             ok=ok,
-            error="" if ok else "HTTP %d %s" % (resp.status_code, _reason(resp.status_code)),
-            error_code="HTTP" if not ok else None,
+            error="" if ok else expect_error or "HTTP %d %s" % (resp.status_code, _reason(resp.status_code)),
+            error_code="HTTP" if not ok and not expect_error else ("EXPECT_MISMATCH" if expect_error else None),
             network=NETWORK_LABEL[self.network],
             requested_url=clean_url,
             final_url=final_url,
@@ -449,11 +583,15 @@ class Fetcher:
             text_length=len(kind["text"]),
             total_text_length=len(kind["text"]),
             returned_text_length=len(rendered_text),
+            estimated_tokens=estimate_tokens(rendered_text),
+            estimated_tokens_total=estimate_tokens(kind["text"]),
             took_ms=took,
             links=kind["links"],
             link_count=len(kind["links"]),
             metadata=kind["metadata"],
             needs_renderer=kind["needs_renderer"],
+            payload_extracted=kind["payload_extracted"],
+            items=kind["items"],
             text=rendered_text,
             markdown=rendered_markdown or "",
             headings=kind["headings"],
@@ -464,9 +602,11 @@ class Fetcher:
             redirect_chain=[r.url for r in resp.history] + [final_url],
             proxy_used=self.proxy_url() or None,
         )
+        if expect_error and not eff_allow_errors:
+            result["error"] = expect_error
         if not ok:
-            result["error_code"] = "HTTP"
-            result["error"] = "HTTP %d %s" % (resp.status_code, _reason(resp.status_code))
+            result["error_code"] = result["error_code"] or "HTTP"
+            result["error"] = result["error"] or "HTTP %d %s" % (resp.status_code, _reason(resp.status_code))
         if self._cache_safe and method == "GET" and ok and not resp.history:
             self.cache.put(
                 self.network,
@@ -525,6 +665,19 @@ class Fetcher:
                 pass
         return out
 
+    def _expect_check(self, kind):
+        """Return an error message when ``self.expect`` disagrees with the
+        parsed ``content_kind`` (catches exit-proxy interstitials that answer
+        HTML when an API/JSON was requested)."""
+        if not self.expect:
+            return ""
+        want = self.expect.lower()
+        if want not in ("html", "json", "pdf", "rss", "text", "image", "unknown"):
+            return ""
+        if kind != want:
+            return "expected content kind %r but got %r (server replied with a different content-type)" % (want, kind)
+        return ""
+
     def _from_cache(self, cached, url, t0, keep_raw=False):
         meta, body = cached["meta"], cached["body"]
         content_type = meta.get("content_type") or ""
@@ -535,6 +688,7 @@ class Fetcher:
             final_url=meta.get("final_url") or url,
             source_len=len(body),
             max_links=self.max_links,
+            raw_body=body,
         )
         rendered_text = _truncate(kind["text"], self.max_chars, "text")
         rendered_markdown = _truncate(kind["markdown"], self.max_chars, "text")
@@ -554,11 +708,15 @@ class Fetcher:
             text_length=len(kind["text"]),
             total_text_length=len(kind["text"]),
             returned_text_length=len(rendered_text),
+            estimated_tokens=estimate_tokens(rendered_text),
+            estimated_tokens_total=estimate_tokens(kind["text"]),
             took_ms=0,
             links=kind["links"],
             link_count=len(kind["links"]),
             metadata=kind["metadata"],
             needs_renderer=kind["needs_renderer"],
+            payload_extracted=kind["payload_extracted"],
+            items=kind["items"],
             text=rendered_text,
             markdown=rendered_markdown or "",
             headings=kind["headings"],

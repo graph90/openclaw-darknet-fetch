@@ -104,6 +104,10 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, "text/html", body)
         elif path == "/pdf":
             self._send(200, "application/pdf", b"%PDF-1.4 fake")
+        elif path == "/robots.txt":
+            self._send(200, "text/plain; charset=utf-8", b"User-agent: *\nDisallow: /blocked\n")
+        elif path == "/blocked":
+            self._send(200, "text/plain; charset=utf-8", b"robots said no")
         elif path == "/echo":
             self._send(200, "text/plain; charset=utf-8", b"echo:" + query.encode("utf-8"))
         elif path == "/preview":

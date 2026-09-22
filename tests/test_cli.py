@@ -33,14 +33,18 @@ def run_legacy(args, cwd=REPO):
 
 class TestCliBasics:
     def test_version(self):
+        from openclaw_fetch import __version__
+
         p = run_cli(["--version"])
         assert p.returncode == 0
-        assert "0.2.0" in p.stdout
+        assert __version__ in p.stdout
 
     def test_legacy_shim_version(self):
+        from openclaw_fetch import __version__
+
         p = run_legacy(["--version"])
         assert p.returncode == 0
-        assert "0.2.0" in p.stdout
+        assert __version__ in p.stdout
 
     def test_single_json(self, server):
         p = run_cli(["-n", server.url("/"), "--json"])

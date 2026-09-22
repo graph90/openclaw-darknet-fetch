@@ -4,6 +4,7 @@ plus content-kind dispatch for JSON / PDF / plain text / images / feeds.
 
 import json
 import re
+import shutil
 from html.parser import HTMLParser
 from urllib.parse import urljoin
 
@@ -322,11 +323,13 @@ def classify_content_type(content_type):
 
 
 def parse_document(text, *, content_type="", requested_url="", final_url="",
-                   source_len=0, max_links=50, kind=None):
+                   source_len=0, max_links=50, kind=None, raw_body=None):
     """Parse body text into a normalized document dict.
 
-    ``text`` is the already-decoded body. Never raises: random bytes or
-    malformed HTML are survivable (fuzz contract from plan section 12).
+    ``text`` is the already-decoded body; ``raw_body`` (bytes) is optional and
+    lets binary kinds (PDF) extract from the original bytes. Never raises:
+    random bytes or malformed HTML are survivable (fuzz contract from plan
+    section 12).
     """
     if kind is None:
         kind = classify_content_type(content_type)
@@ -339,19 +342,40 @@ def parse_document(text, *, content_type="", requested_url="", final_url="",
         "metadata": {},
         "needs_renderer": False,
         "headings": [],
+        "items": [],
+        "payload_extracted": False,
     }
     if kind == "json":
         pretty = _try_json_pretty(text)
         result["text"] = pretty or text
         result["markdown"] = ""
         return result
-    if kind in ("pdf", "image"):
-        result["text"] = "[%s content: %s bytes (extraction requires pypdf / --download)]" % (
-            kind,
-            source_len,
-        )
+    if kind == "pdf":
+        result["text"], pdf_method = extract_pdf_text(raw_body)
+        if pdf_method:
+            result["markdown"] = result["text"]
+            result["metadata"]["pdf_extraction"] = pdf_method
+        else:
+            result["text"] = "[pdf content: %s bytes (extraction needs pypdf or the pdftotext binary)]" % source_len
         return result
-    if "html" not in kind and kind != "rss":
+    if kind == "image":
+        result["text"] = "[image content: %s bytes (use --save-raw to download)]" % source_len
+        return result
+    if kind == "rss":
+        feed = parse_feed(text)
+        result["title"] = feed.get("title", "")
+        result["items"] = feed.get("items", [])
+        result["text"] = feed.get("text", "")
+        result["markdown"] = feed.get("text", "")
+        result["links"] = [
+            {"url": item["link"], "text": item.get("title", ""), "title": item.get("title", "")}
+            for item in result["items"][:max_links]
+            if item.get("link")
+        ]
+        result["link_count"] = len(result["links"])
+        result["metadata"] = feed.get("metadata", {})
+        return result
+    if "html" not in kind:
         result["text"] = text
         return result
     parser = HTMLDocumentParser(base_url=final_url or requested_url, source_len=source_len)
@@ -371,7 +395,204 @@ def parse_document(text, *, content_type="", requested_url="", final_url="",
     if not result["title"]:
         result["title"] = result["metadata"].get("og:title", "")
     result["needs_renderer"] = needs_renderer(text, len(result["text"]))
+    payload = extract_embedded_json(text)
+    if payload and result["needs_renderer"]:
+        result["text"] = payload
+        result["markdown"] = payload
+        result["payload_extracted"] = True
     return result
+
+
+def extract_pdf_text(raw_body):
+    """Extract text from PDF bytes. Returns ``(text, method)`` where ``method``
+    is ``"pypdf"``, ``"pdftotext"``, or ``None`` when neither is usable."""
+    if raw_body is None:
+        return "", None
+    method = _pdf_via_pypdf(raw_body)
+    if method:
+        return method
+    method = _pdf_via_pdftotext(raw_body)
+    if method:
+        return method
+    return "", None
+
+
+def _pdf_via_pypdf(raw_body):
+    try:
+        from pypdf import PdfReader
+    except ImportError:
+        return None
+    try:
+        import io
+
+        reader = PdfReader(io.BytesIO(raw_body))
+        pages = []
+        for page in reader.pages[:50]:
+            pages.append(page.extract_text() or "")
+        text = "\n\n".join(pages).strip()
+        if text:
+            return text, "pypdf"
+    except Exception:
+        pass
+    return None
+
+
+def _pdf_via_pdftotext(raw_body):
+    import subprocess
+    import tempfile
+
+    if shutil.which("pdftotext") is None:
+        return None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".pdf") as tmp:
+            tmp.write(raw_body)
+            tmp.flush()
+            proc = subprocess.run(
+                ["pdftotext", "-layout", tmp.name, "-"],
+                capture_output=True,
+                timeout=30,
+            )
+        if proc.returncode == 0 and proc.stdout.strip():
+            return proc.stdout.decode("utf-8", errors="replace").strip(), "pdftotext"
+    except Exception:
+        pass
+    return None
+
+
+def parse_feed(text):
+    """Parse RSS 2.0 / Atom / RDF XML into a feed dict.
+
+    Returns ``{title, items: [{title, link, guid, date, summary, tags}],
+    text, metadata}``. Never raises on malformed XML.
+    """
+    import xml.etree.ElementTree as ET
+
+    feed = {"title": "", "items": [], "text": "", "metadata": {}}
+    try:
+        root = ET.fromstring(text)
+    except Exception:
+        feed["text"] = _collapse(text)
+        return feed
+
+    def local(tag):
+        return tag.rsplit("}", 1)[-1].lower()
+
+    def child_text(el, name):
+        for node in el.iter():
+            if local(node.tag) == name and node.text:
+                return node.text.strip()
+        return ""
+
+    def child_all(el, name):
+        out = []
+        for node in el.iter():
+            if local(node.tag) == name and node.text and node.text.strip():
+                out.append(node.text.strip())
+        return out
+
+    feed["title"] = child_text(root, "title")
+    channel = root if local(root.tag) in ("rss", "feed", "rdf") else root
+    item_nodes = [
+        node for node in channel.iter() if local(node.tag) in ("item", "entry")
+    ]
+    seen = set()
+    for node in item_nodes:
+        link = child_text(node, "link")
+        full_link = ""
+        for link_node in node.iter():
+            if local(link_node.tag) == "link":
+                href = link_node.attrib.get("href")
+                if href:
+                    full_link = href
+                elif link_node.text:
+                    full_link = link_node.text.strip()
+                if full_link:
+                    break
+        link = full_link or link
+        title = child_text(node, "title")
+        guid = child_text(node, "guid") or link
+        if not (link or guid):
+            continue
+        if guid in seen:
+            continue
+        seen.add(guid)
+        item = {
+            "title": title,
+            "link": _collapse(link) if link else "",
+            "guid": guid,
+            "date": child_text(node, "pubdate") or child_text(node, "published") or child_text(node, "updated"),
+            "summary": _collapse(child_text(node, "description") or child_text(node, "summary") or child_text(node, "content")),
+            "tags": child_all(node, "category")[:10],
+        }
+        feed["items"].append(item)
+    lines = []
+    for item in feed["items"]:
+        title = item["title"] or item["link"]
+        lines.append("- %s" % title)
+        if item["summary"]:
+            lines.append("  %s" % item["summary"][:400])
+    feed["text"] = "\n".join(lines)
+    feed["metadata"]["feed_title"] = feed["title"]
+    feed["metadata"]["feed_type"] = local(root.tag)
+    feed["metadata"]["item_count"] = len(feed["items"])
+    return feed
+
+
+def extract_embedded_json(html):
+    """Pull structured content out of SPA payloads embedded in the page.
+
+    Recognizes ``<script type="application/json">{...}</script>`` (Next.js
+    ``__NEXT_DATA__`` and friends) and JavaScript assignments like
+    ``window.__INITIAL_STATE__ = {...}`` / ``window.store = {...}``.
+    Returns pretty-printed JSON text (or ``""`` when nothing useful is found).
+    """
+    if not html:
+        return ""
+    candidates = []
+    for match in re.finditer(
+        r'<script[^>]+type=["\']application/json["\'][^>]*>(.*?)</script>',
+        html,
+        re.IGNORECASE | re.DOTALL,
+    ):
+        candidates.append(match.group(1).strip())
+    for block in re.finditer(
+        r"window\.(__NEXT_DATA__|__INITIAL_STATE__|store|__NUXT__)\s*=\s*(\{.*?\});",
+        html,
+        re.DOTALL,
+    ):
+        candidates.append(_balanced_json(block.group(2)))
+    for cand in candidates:
+        if not cand:
+            continue
+        pretty = _try_json_pretty(cand)
+        if pretty:
+            return pretty
+    return ""
+
+
+def _balanced_json(raw):
+    """Trim a JS object literal to its matching close brace (best effort)."""
+    depth = 0
+    in_str = False
+    escape = False
+    for i, ch in enumerate(raw):
+        if in_str:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return raw[: i + 1]
+    return raw
 
 
 def _try_json_pretty(text):

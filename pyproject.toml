@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "openclaw-fetch"
-version = "0.2.0"
+version = "0.3.0"
 description = "Multi-network (Normal/Tor/I2P) fetcher toolkit for AI agents"
 readme = "README.md"
 requires-python = ">=3.9"

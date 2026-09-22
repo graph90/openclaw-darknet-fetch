@@ -22,6 +22,7 @@ EXIT_CODES = {
     "BODY_TOO_LARGE": 6,
     "BUDGET": 6,
     "HOST_BLOCKED": 6,
+    "ROBOTS_BLOCKED": 6,
 }
 
 DEFAULT_EXIT_CODE = 6
