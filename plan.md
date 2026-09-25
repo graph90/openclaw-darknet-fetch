@@ -4,6 +4,9 @@ Multi-network fetcher for AI agents. Current version is a single-file CLI that f
 over Normal/Tor/I2P and returns text/links as human text or JSON. This plan grows it from a
 "fetch one page" tool into a production-grade agent toolkit without breaking existing usage.
 
+> **Part II (from section 15 onward) is the live roadmap** and supersedes the historical
+> plans below. Sections 1-14 are kept as the shipped record.
+
 **Defining goal:** a universal, production-safe network toolkit for AI agents that gets the
 most out of clearnet, **Tor, and I2P** — maximizing the *reachable* information surface —
 secure by default, safe under real-world network pathology, and consumable by any agent
@@ -433,3 +436,263 @@ network needed).
 `--find-mirrors`/`--mirrors`, `--collect-documents`, `--i2p-jump`, circuit rotation via
 ControlPort, `Result.items` collision, raw/binary contract, RSS relative links, library JSON
 validation, robots `allow_errors`, search-result cache poisoning, CI (ruff/mypy), docs/EXAMPLES.
+
+---
+---
+
+# Part II — v3 roadmap: the agent's darknet browser
+
+Everything above (Part I) is the shipped history. This part is the forward plan and it
+**supersedes Part I sections 10-14** wherever they disagree.
+
+**Defining goal for v3:** an agent should be able to *find* darknet content, *read* it even
+when it is JavaScript-only, *corroborate* it across clearnet/Tor/I2P, and *prove* how it got
+there — with one tool call each, and never silently degrade its own anonymity to do it.
+
+## 15. Design principles (read before adding any feature)
+
+1. **Provenance over payload.** Every result carries *how it was fetched*, not just what:
+   resolved network, isolation mode, exit IP + `is_tor`, circuit id when available,
+   redirect chain, cache hit, content hash, and `fetched_at`. Agents reason about anonymity
+   domains; we should hand them the evidence instead of adjectives.
+2. **Anonymity is verified, never assumed.** If isolation is on but the torrc lacks
+   `IsolateSOCKSAuth`, the feature is *not working*. We must detect and report that, not
+   claim a guarantee we cannot check.
+3. **Never silently fall back to a weaker network.** An onion fetch that quietly degrades to
+   the clearnet is a privacy bug, not a feature. Fail with guidance, or ask.
+4. **Every feature ships a JSON contract and an offline test.** No new output shape without
+   a fixture-based test in `tests/`, and no new network call without an injectable seam.
+5. **Composite beats primitive.** An agent does not want "fetch 3 URLs"; it wants "read this
+   topic from the darknet and give me a sourced brief". Design top-down from agent tasks.
+6. **Token economics are a first-class output.** Every multi-fetch operation reports
+   estimated tokens, per-source token cost, and supports a budget.
+7. **Darknet reality is hostile to nice clients:** sites vanish, handshakes stall, engines
+   challenge, mirrors rot. The tool's job is to absorb that pathology and report it as data
+   (`suspected_dead`, `blocked_by`, `rtt_ms`) rather than as exceptions.
+
+## 16. Audit snapshot (2026-09-25, verified by reading the code)
+
+Real today: `network=auto` TLD routing, tor66 + marginalia + ahmia + ddg + searxng search
+with per-network fallback and block detection, `--search-fetch-top`, crawl, RSS/PDF/SPA-JSON
+extraction, disk cache, cookie jar, SSRF/redirect hardening, `error_result` full shape, MCP
+server, 145 tests, live-verified on Tor and I2P.
+
+Known contract bugs found while planning (all P0, all cheap):
+
+| # | Bug | Location | Impact |
+|---|---|---|---|
+| 1 | `--search Q` with no `--search-backend` sends `backend=None` → `USAGE` ("unknown search backend None"); human output hides it as `BACKEND: auto / RESULTS: 0` | `cli.py:99`, `cli.py:328` | **flagship path is broken** |
+| 2 | `check_proxy_for("auto")` raises `KeyError: 'auto'` | `fetcher.py:895-913` | MCP/library crash |
+| 3 | `fetch(..., format="markdown")` (documented in README + `__init__.py`) → `TypeError` | `fetcher.py:77-109` | docs lie; agents crash |
+| 4 | `crawl()` returns `ok=True` when every page failed; `pages_fetched` counts attempts | `crawl.py:116-126` | agents treat failure as success |
+| 5 | `r.items` is `dict.items`, not RSS items (only `r["items"]` works) | `result.py:11-30` | documented API broken |
+| 6 | `--raw` returns decoded text, not bytes; `--save-raw` is a documented no-op | `output.py:67-71`, `cli.py:125` | binary content unusable |
+| 7 | `parse_feed()` has no `base_url` → relative RSS links stay relative | `parse.py:462-538` | broken item URLs |
+| 8 | `expect=` mismatch + `allow_errors=True` → `ok=True` **with** `error_code` set | `fetcher.py:797-839` | exit 0 on contract violation |
+| 9 | `search()` on `auto` chains can return `ok=True` with 0 results when one engine was empty and another failed | `search.py:364-443` | silent empty results |
+| 10 | Two tests hit live endpoints while README claims the suite is fully offline | `tests/test_fetch.py:270`, `tests/test_cli.py:196` | flaky CI story |
+
+## 17. Phase 0 — contract honesty (do first, ~1 day)
+
+Nothing else matters if the documented contract is a lie. Fix #1-#10, then **stop
+appending "shipped" sections and keep `plan.md` as a live status board** (a `status:`
+column per item, updated in the same commit as the code).
+
+- `#1` one-liner: `backend = args.search_backend or "auto"`; add offline CLI test that
+  `--search` with a stub engine returns results.
+- `#3` implement `format=` on the module-level `fetch()` (post-process the `Result`, not the
+  `Fetcher`) and add `format` to the library docstrings; `fetch_many` likewise.
+- `#4` `crawl()` gains `pages_succeeded`, `pages_failed`, and `ok = pages_succeeded > 0`.
+- `#5` never remove the `items` key; document `r["items"]`; add `Result.feed_items` as a
+  non-colliding alias and a regression test.
+- `#6` define raw as bytes: keep `_raw_body` bytes, write via `sys.stdout.buffer` in `--raw`,
+  make `--save-raw PATH` actually write the file (and fix the image hint in `parse.py`).
+- `#8` `allow_errors` must not flip `ok` to true for `expect` mismatches; separate
+  `error_code="EXPECT_MISMATCH"` from `ok`.
+- `#9` auto search distinguishes "no results" from "all backends failed": if every backend
+  failed, `ok=False`; if at least one succeeded with 0 hits, `ok=True, total_results=0`.
+- `#10` mark live tests `@pytest.mark.live`, add `pytest -m "not live"` to CI.
+
+## 18. Phase 1 — Tor you can see and control
+
+The differentiator. Today "isolation" is a string we generate and hope `torrc` honors.
+
+1. **`--tor-doctor` / `doctor()` — verify the daemon actually supports what we claim.**
+   Check `ControlPort` reachable, `IsolateSOCKSAuth`/`IsolateClientAddr` present,
+   `CookieAuthentication`, SocksPort host/port, `ClientUseIPv4/6`, `StrictNodes`,
+   and print the exact torrc lines to add. **If `IsolateSOCKSAuth` is off, warn that
+   per-request isolation is a no-op.** This is the single most important honesty fix in the
+   whole roadmap.
+2. **Optional ControlPort support (`[tor]` extra: `stem`).** `TorControl` wrapper:
+   `GETINFO status/bootstrap-phase`, `GETINFO circuit-status`, `GETINFO onions/current`,
+   `SIGNAL NEWNYM`, `SETCONF`. Degrade to a clear message when unavailable.
+3. **`circuit_id` + guard/exit in provenance.** Map the in-flight stream to a circuit
+   (`stem` stream events) and attach `circuit_id`, `guard`, `exit_node`, `exit_country`
+   (via a tiny offline GeoIP table or an optional `maxminddb` extra) to the result.
+4. **`--tor-verify` (default on for `auto`/`tor` in agent mode): per-request exit
+   verification.** After each fetch, confirm the response actually came through Tor
+   (`is_tor` check, cached per circuit, not per request). Fail closed with
+   `error_code="ANONYMITY_UNVERIFIED"`. An agent must be able to *trust* a darknet read.
+5. **`--tor-exit-avoid COUNTRY[,ASNS...]` / `--tor-exit-require`.** Refuse exits in
+   jurisdictions an agent should not touch (mass surveillance, blocking). Implemented by
+   retrying until an acceptable exit appears (with a budget) — this is a *policy* primitive
+   no generic HTTP client offers.
+6. **NEWNYM on failure, not only on demand.** After N consecutive failures on the same
+   circuit, `SIGNAL NEWNYM` and retry (the "stuck exit" case: captchas, 403 walls, 503
+   walls). Also rotate on `blocked_by` detection.
+7. **Onion service primitives.**
+   - v3 address validation (56 chars, base32, checksum) and clear errors for typos —
+     a wrong onion currently looks like a timeout.
+   - `Onion-Location` header harvesting: fetch the clearnet site, collect
+     `Onion-Location: <url>` and `X-I2P-*`-style hints into `metadata.mirrors` so an agent
+     learns the *official* onion without an index.
+   - `suspected_dead` accounting: a small on-disk ledger of onion↔(ok, rtt, last_seen);
+     after k consecutive failures, return it fast with `suspected_dead: true` instead of
+     burning 90s of timeouts. Agents crawl flaky onions constantly; this is a real speedup.
+8. **Guarded exits vs `strict_nodes`:** document and expose whether we set `StrictNodes` for
+   isolation guarantees, and what that means for the "random exit" property.
+
+## 19. Phase 2 — I2P depth
+
+I2P is the least mature path and the most neglected; the plan should say so honestly.
+
+1. **Addressbook + jump service.** Many `.b32.i2p` hostnames do not resolve through the HTTP
+   proxy. Implement `.b32.i2p` → base32-address conversion, jump-service resolution
+   (`--i2p-jump HOST[:port]`, default `router.i2p:port=...`), and **multi-destination
+   fallback**: on failure, try the router's alternate jump destinations and report which one
+   worked in `metadata.jump_via`.
+2. **Outproxy honesty.** I2P clearnet access is via *outproxies*, which are not anonymous and
+   are a known correlation/leak point. Requirements:
+   - detect when a clearnet fetch went through an outproxy and set
+     `metadata.i2p_outproxy_used: true`,
+   - refuse/warn when an agent asks for "anonymous clearnet" over I2P,
+   - document that `-i` is for eepsites, and that `-i` + `.onion` is impossible (no onion
+     support in I2P) — surface `NETWORK_MISMATCH` with that exact reason.
+3. **A real eepsite index.** I2P has no onion-style search index, so build one:
+   - `--i2p-index-refresh` crawls the known eepsite directory pages (Postman index,
+     i2p-projekt eepsite lists, curated seeds) into a local signed JSON index with
+     `last_seen`/`dead` fields,
+   - a `postman` search backend serves that local index (fast, offline-friendly),
+   - dead-link detection marks entries dead so agents stop retrying them.
+4. **I2P-appropriate timeouts and pacing.** Eepsites are slow (tunnel build dominates).
+   Per-network timeout floors (I2P > Tor > clearnet), lower default concurrency for I2P, and
+   `--i2p-patience` for "I will wait as long as it takes" mode.
+5. **Eepsite-specific extraction.** Many eepsites are old-style HTML forms and directory
+   index pages; add link-list extraction ("directory page" content kind) and a
+   "collect every `.b32.i2p` link on this page" primitive, which is how eepsite graphs
+   actually grow.
+
+## 20. Phase 3 — discovery, mirrors, corroboration
+
+1. **`find_mirrors(site) -> {clearnet, onions[], i2ps[], sources[]}`** from three sources:
+   `Onion-Location` headers (authoritative), search indexes (tor66/marginalia), and curated
+   lists. `sources[]` records provenance so an agent can weigh authority.
+2. **`compare(urls|site) -> availability matrix + content diff`, fetched in parallel across
+   networks.** This is the single most agent-useful primitive in the darknet: "the
+   clearnet copy is stale/blocked, the onion copy is fresh" in one call. Include
+   `freshness` (Last-Modified/date), `content_sha256`, and a real text diff
+   (`difflib` over extracted markdown, token-budgeted).
+3. **`--collect-documents`**: from a page, bucket discovered links (pdf/doc/xls/epub/torrent/
+   magnet) without downloading them, and optionally download with a byte budget.
+4. **Link classification** for crawl/search results: `onion`, `i2p`, `onion-mail`, `torrc`,
+   `magnet`, `download`, `nav`, `article`, `leave-site`. Agents should be able to ask for
+   "only the substantive links" and get a shortlist, not 200 nav items.
+
+## 21. Phase 4 — agent-native operations (the wow layer)
+
+1. **`deep_fetch(topic, ...) -> sourced brief`.** The flagship composite: search across
+   networks → dedupe URLs → fetch top N in parallel (isolated circuits) → content-hash
+   dedupe → order by agreement/credibility → emit a single markdown brief with per-sentence
+   provenance, `sources[]` (url, network, exit_ip, is_tor, fetched_at, sha256) and a token
+   accounting block. One MCP tool call replaces ~10 agent steps.
+2. **`watch(url, interval, until_change)`**: poll with `ETag`/`Last-Modified`/hash and emit
+   JSONL change events. Onion sites rotate content and appear/disappear; "did this change"
+   is a real agent need, and cheap on Tor via conditional requests.
+3. **Resumable crawls**: `--checkpoint FILE` persisting frontier + visited set +
+   per-URL last status, so a flaky-onion crawl can be resumed across invocations. Onion
+   crawls *will* be interrupted; make that a first-class flow.
+4. **Budgets**: implement the already-reserved `BUDGET` error code —
+   `--budget-seconds/--budget-bytes/--budget-tokens/--budget-requests`, enforced in fetch,
+   crawl, and `deep_fetch`, with `budget_exhausted` reported (never a crash).
+5. **`dry_run` / `estimate` for every composite**: return projected pages, tokens, and cost
+   *before* any network call, so an agent can decide. Extend `estimate_tokens`.
+6. **MCP surface**: expose `deep_fetch`, `compare`, `find_mirrors`, `watch`, `doctor`, and
+   `estimate`; add `search_url`/`time_range`/`include_sponsored` to the search tools;
+   validate `network`/`format` enums in Python (not just argparse); fix the
+   `max_chars=0` fetcher leak in MCP `search_fetch`.
+7. **Structured event log** (`--log-jsonl FILE`, one line per request/hop/event with
+   `{ts, network, url, status, took_ms, cached, event}`) so an agent's whole run is
+   auditable and replayable. This is the "no telemetry" story made verifiable.
+
+## 22. Phase 5 — read what darknet actually serves
+
+1. **Optional headless renderer through the same proxy** (`[render]` extra: playwright).
+   Most onion front-ends and a large share of eepsites are JS-only — a large fraction of the
+   darknet is currently *unreadable* by this tool. Per-browser-context proxy config gives us
+   per-context circuits, i.e. isolation for free. `needs_renderer` already flags these pages;
+   wire it to an opt-in `--render`.
+2. **Cheap extraction modes for token budgets**: `--metadata-only` (title + headings +
+   classified links), `--selector CSS` (precise region), `--extract json|csv` (tables/forms).
+3. **Content dedupe/clustering across networks** (SimHash/MinHash on extracted text) so
+   mirrors/aggregators do not eat the budget; report clusters instead of duplicates.
+4. **Cheap offline language detection** on extracted text so agents can filter non-English
+   mirrors before spending tokens.
+
+## 23. Phase 6 — ops, quality, distribution
+
+- CI running only offline tests (`-m "not live"`), ruff + mypy, a real fake-I2P-proxy
+  fixture (today I2P is only tested by config selection), a real-PDF fixture, and a
+  `live` marker for the Tor/I2P tests.
+- Extras matrix: `[pdf] [mcp] [tor]` (stem) `[render]` (playwright) `[all]`. `plan.md`
+  currently claims a `[tor]` extra that does not exist.
+- Config file support (`config.toml`) — `config.py` docstring claims it; there is no loader.
+  Per-network sections (`[tor]`, `[i2p]`, `[auto]`) so darknet defaults live in one place.
+- Docker image bundling `tor` + `i2pd` so `--env-report`/doctor can self-verify; release
+  workflow; PyPI publish; `docs/EXAMPLES.md`; `SECURITY.md` with the anonymity model
+  (what is guaranteed, what is best-effort, what is out of scope).
+
+## 24. Milestones (dependency-ordered, with honest sizing)
+
+| # | Milestone | Depends on | Size | Why now |
+|---|---|---|---|---|
+| M0 | Phase 0 contract honesty | — | 1d | documented behavior must be true first |
+| M1 | `doctor()` + isolation verification | M0 | 2d | makes the current isolation claim honest |
+| M2 | Provenance block + `--tor-verify` per request | M0 | 3d | the evidence agents need to trust darknet reads |
+| M3 | ControlPort/stem: circuits, `circuit_id`, NEWNYM-on-fail, exit policy | M1, M2 | 5d | real Tor control, the differentiator |
+| M4 | I2P addressbook/jump + outproxy honesty + eepsite index | M0 | 5d | I2P is the weakest path today |
+| M5 | `find_mirrors` + `compare` (availability + diff) | M2 | 4d | highest agent utility per line of code |
+| M6 | `deep_fetch` composite + budgets + `dry_run` | M5 | 5d | the flagship one-call agent workflow |
+| M7 | `Onion-Location` harvesting, dead-onion ledger, link classification | M2 | 3d | discovery + crawl efficiency |
+| M8 | `--render` (playwright over proxy) + extraction modes | M0 | 5d | unlocks JS-only darknet content |
+| M9 | `watch` + resumable crawl checkpoints | M2 | 3d | flaky-site reality |
+| M10 | MCP expansion + structured log + enums | M5 | 3d | agent runtime completeness |
+| M11 | CI/ruff/mypy/fake-I2P fixture/extras/Docker/config.toml/docs | M0 | 5d | makes the rest sustainable |
+
+## 25. Success metrics (how we know the goal was met)
+
+- **Usable-text rate on real darknet pages:** ≥ 80% of sampled onion/eepsite URLs return
+  non-trivial extracted text (today: unknown, likely low — measure it in M0 with a 100-URL
+  sampler and print the number; the `--render` milestone is judged by moving it).
+- **Provenance completeness:** 100% of agent-visible results carry network, isolation mode,
+  exit-verification state, content hash, and timestamp.
+- **Anonymity honesty:** 0 cases where a darknet request silently used a weaker network; 0
+  cases where isolation is claimed without `IsolateSOCKSAuth` being verified.
+- **Task success on the canonical agent task set** (each must pass end-to-end, JSON output,
+  offline-safe tests where possible):
+  1. "Find onion forums about topic X" → tor66/ahmia results with real onion URLs.
+  2. "This clearnet site is blocked for me, read it anyway" → mirror discovery + compare →
+     freshest copy.
+  3. "Read this eepsite and its onion mirror, tell me if they agree" → i2p + onion + diff.
+  4. "Tell me if this onion changed in the last hour" → watch/checkpoint.
+  5. "Is this onion alive?" → fast `suspected_dead` verdict within seconds, not minutes.
+- **Contract integrity:** every documented example in README/plan runs; 0 `TypeError`s from
+  documented kwargs; `pytest -m "not live"` green with no network.
+
+## 26. Non-goals (deliberate, to protect focus)
+
+- No native I2CP/tunnel transport (stay an HTTP client; I2P via its proxy).
+- No Tor-internals reimplementation, no fingerprint evasion, no deanonymization research.
+- No scraping of private/paid services, no credentialed logins beyond the user's own jar.
+- No attempt to be a general search engine: we orchestrate existing indexes and clearly
+  report which engine produced what.
+- No anonymity claims we cannot verify (Principle 2).
