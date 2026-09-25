@@ -15,6 +15,7 @@ and any MCP client without glue code.
 """
 
 from concurrent.futures import ThreadPoolExecutor
+from typing import Optional
 
 from .util import estimate_tokens
 
@@ -32,25 +33,40 @@ def _build_server(network="normal", **defaults):
 
     mcp = FastMCP("openclaw-fetch")
     default_network = network
+    server_defaults = dict(defaults)
+    server_defaults["no_private_ip"] = True
 
-    def base_kwargs(**kw):
+    def selected_network(value):
+        return value or default_network
+
+    def base_kwargs(network=None, **overrides):
         merged = {"network": default_network}
-        merged.update(defaults)
-        merged.update({k: v for k, v in kw.items() if v is not None})
+        merged.update(server_defaults)
+        if network is not None:
+            merged["network"] = network
+        merged.update({k: v for k, v in overrides.items() if v is not None})
         return merged
 
     @mcp.tool()
-    def fetch(url: str, network: str = "normal", format: str = "text",
-              max_chars: int = 12000, max_links: int = 50,
-              allow_errors: bool = False) -> dict:
-        """Fetch one URL over normal/Tor/I2P and return structured content."""
+    def fetch(url: str, network: Optional[str] = None, format: str = "text",
+              max_chars: Optional[int] = None, max_links: Optional[int] = None,
+              allow_errors: Optional[bool] = None, isolate: Optional[bool] = None) -> dict:
+        """Fetch one URL over normal/Tor/I2P and return structured content.
+
+        ``network="auto"`` routes .onion over Tor, .i2p over I2P and everything
+        else over the clearnet. ``isolate`` gives each Tor request its own
+        circuit.
+        """
         from .fetcher import Fetcher
 
-        kw = base_kwargs(network=network)
-        fetcher = Fetcher(
-            max_chars=max_chars, max_links=max_links,
-            allow_errors=allow_errors, **kw,
+        options = base_kwargs(
+            network=network, max_chars=max_chars, max_links=max_links,
+            allow_errors=allow_errors, isolate=isolate,
         )
+        options.setdefault("max_chars", 12000)
+        options.setdefault("max_links", 50)
+        options.setdefault("allow_errors", False)
+        fetcher = Fetcher(**options)
         result = fetcher.fetch(url)
         out = result.to_dict()
         out.pop("_raw_body", None)
@@ -59,16 +75,15 @@ def _build_server(network="normal", **defaults):
         return out
 
     @mcp.tool()
-    def fetch_many(urls: list, network: str = "normal", concurrency: int = 4,
-                   max_chars: int = 12000) -> list:
+    def fetch_many(urls: list, network: Optional[str] = None,
+                   concurrency: int = 4, max_chars: Optional[int] = None,
+                   isolate: Optional[bool] = None) -> list:
         """Fetch many URLs in parallel, returning results in input order."""
         from .fetcher import Fetcher
 
-        fetcher = Fetcher(
-            max_chars=max_chars, network=network, **{
-                k: v for k, v in base_kwargs().items() if k != "network"
-            },
-        )
+        options = base_kwargs(network=network, max_chars=max_chars, isolate=isolate)
+        options.setdefault("max_chars", 12000)
+        fetcher = Fetcher(**options)
         results = fetcher.fetch_many(list(urls), concurrency=concurrency)
         out = []
         for result in results:
@@ -79,40 +94,56 @@ def _build_server(network="normal", **defaults):
 
     @mcp.tool()
     def crawl(seed_url: str, depth: int = 1, max_pages: int = 10,
-              network: str = "normal", concurrency: int = 3) -> dict:
+              network: Optional[str] = None, concurrency: int = 3) -> dict:
         """Crawl up to `depth` hops from a seed URL, bounded by max_pages."""
         from .crawl import crawl as run_crawl
 
+        options = base_kwargs(network=network)
+        fetcher_options = {k: v for k, v in options.items() if k != "network"}
         return run_crawl(
             seed_url, depth=depth, max_pages=max_pages,
-            network=network, concurrency=concurrency,
-            same_host=True,
+            network=selected_network(network), concurrency=concurrency,
+            same_host=True, fetcher_kwargs=fetcher_options,
         )
 
     @mcp.tool()
-    def search(query: str, network: str = "normal", backend: str = "auto",
+    def search(query: str, network: Optional[str] = None, backend: str = "auto",
                max_results: int = 8) -> dict:
         """Search the web (DuckDuckGo / Ahmia / SearXNG) over a network."""
         from .search import search as run_search
 
-        return run_search(query, network=network, backend=backend,
-                          max_results=max_results)
+        options = base_kwargs(network=network)
+        fetcher_options = {k: v for k, v in options.items() if k != "network"}
+        fetcher_options["max_chars"] = 0
+        return run_search(
+            query, network=selected_network(network), backend=backend,
+            max_results=max_results, **fetcher_options,
+        )
 
     @mcp.tool()
-    def search_fetch(query: str, top_n: int = 3, network: str = "normal",
+    def search_fetch(query: str, top_n: int = 3, network: Optional[str] = None,
                      backend: str = "auto") -> dict:
         """Search, then fetch the top results through the same network."""
         from .search import search_fetch as run_search_fetch
 
-        return run_search_fetch(query, top_n=top_n, network=network,
-                                backend=backend)
+        options = base_kwargs(network=network)
+        fetcher_options = {k: v for k, v in options.items() if k != "network"}
+        fetcher_options["max_chars"] = 0
+        return run_search_fetch(
+            query, top_n=top_n, network=selected_network(network),
+            backend=backend, **fetcher_options,
+        )
 
     @mcp.tool()
-    def proxy_status(network: str = "normal") -> dict:
-        """Probe a network's proxy and report reachability (exit IP over Tor)."""
+    def proxy_status(network: Optional[str] = None) -> dict:
+        """Probe a network's proxy and report reachability (exit IP over Tor).
+
+        ``network="auto"`` probes normal, Tor and I2P and returns one entry per
+        network.
+        """
         from .fetcher import Fetcher
 
-        return Fetcher(network=network).check_proxy()
+        return Fetcher(network=selected_network(network), no_private_ip=True).check_proxy()
 
     @mcp.tool()
     def estimate_tokens(text: str) -> dict:

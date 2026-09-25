@@ -13,6 +13,7 @@ from .cache import TtlCache
 from .errors import exit_code_for
 from .fetcher import Fetcher, NETWORK_LABEL
 from .output import render
+from .util import redact_url
 
 
 class _CliParser(argparse.ArgumentParser):
@@ -27,7 +28,8 @@ def build_parser():
     parser = _CliParser(
         prog="openclaw-fetch",
         description="Multi-network (Normal/Tor/I2P) fetcher toolkit for AI agents.",
-        epilog="Networks: -n normal, -t Tor (-t also reaches clearnet), -i I2P",
+        epilog="Networks: -n normal, -t Tor (-t also reaches clearnet), -i I2P, "
+               "-a auto (.onion via Tor, .i2p via I2P, rest clearnet)",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     network_group = parser.add_mutually_exclusive_group()
@@ -42,6 +44,10 @@ def build_parser():
     network_group.add_argument(
         "-i", "--i2p", metavar="URL", nargs="*", default=None,
         help="Fetch through the I2P HTTP proxy.",
+    )
+    network_group.add_argument(
+        "-a", "--auto", metavar="URL", nargs="*", default=None,
+        help="Pick the network per URL: .onion over Tor, .i2p over I2P, else clearnet.",
     )
     parser.add_argument("--batch", metavar="FILE", help="File with one URL per line (and in -n/-t/-i).")
 
@@ -77,6 +83,10 @@ def build_parser():
     parser.add_argument("--tor-proxy", metavar="URL", help="Tor SOCKS5 proxy override.")
     parser.add_argument("--i2p-proxy", metavar="URL", help="I2P HTTP proxy override.")
     parser.add_argument("--ua", metavar="STRING", help="User-Agent override.")
+    parser.add_argument("--isolate", dest="isolate", action="store_true", default=None,
+                        help="Give every Tor request its own circuit (default).")
+    parser.add_argument("--no-isolate", dest="isolate", action="store_false",
+                        help="Reuse one Tor circuit for all requests.")
     parser.add_argument("--check-proxy", action="store_true",
                         help="Probe the configured network/proxy and report reachability.")
     parser.add_argument("--verbose", "-v", action="store_true", help="Log per-request details to stderr.")
@@ -84,9 +94,13 @@ def build_parser():
 
     # -- discovery & workflow ----------------------------------------------
     parser.add_argument("--search", metavar="QUERY",
-                        help="Search (DuckDuckGo / Ahmia / SearXNG) instead of fetching URLs.")
+                        help="Search (Tor66 / Marginalia / DuckDuckGo / Ahmia / SearXNG) "
+                             "instead of fetching URLs.")
     parser.add_argument("--search-backend", metavar="BACKEND|URL",
-                        help="Search backend: auto, ddg, ahmia, or a SearXNG instance URL.")
+                        help="Search backend: auto, tor66, marginalia, ddg, ahmia, "
+                             "or a SearXNG instance URL.")
+    parser.add_argument("--include-sponsored", action="store_true",
+                        help="Keep sponsored/ad search hits (dropped by default).")
     parser.add_argument("--search-fetch-top", type=int, metavar="N",
                         help="After searching, fetch the top N results through the same network.")
     parser.add_argument("--time-range", metavar="RANGE",
@@ -141,7 +155,7 @@ def _read_batch(path):
 def _mcp_command(argv):
     """Handle ``openclaw-fetch mcp [--network N]`` — run the stdio MCP server."""
     p = argparse.ArgumentParser(prog="openclaw-fetch mcp")
-    p.add_argument("--network", default="normal", choices=("normal", "tor", "i2p"))
+    p.add_argument("--network", default="normal", choices=("normal", "tor", "i2p", "auto"))
     p.add_argument("--max-chars", type=int, default=None)
     args, _ = p.parse_known_args(argv)
     from .mcp_server import run_mcp
@@ -158,8 +172,8 @@ def _env_report(args):
     opts["version"] = __version__
     opts["default_cache_dir"] = config.default_cache_dir()
     opts["networks"] = ["normal", "tor", "i2p"]
-    opts["tor_proxy"] = opts.get("tor_proxy", config.TOR_PROXY_DEFAULT)
-    opts["i2p_proxy"] = opts.get("i2p_proxy", config.I2P_PROXY_DEFAULT)
+    opts["tor_proxy"] = redact_url(opts.get("tor_proxy", config.TOR_PROXY_DEFAULT))
+    opts["i2p_proxy"] = redact_url(opts.get("i2p_proxy", config.I2P_PROXY_DEFAULT))
     opts.pop("cache_dir", None)
     import json as _json
 
@@ -199,8 +213,12 @@ def main(argv=None):
     elif args.i2p is not None:
         network = "i2p"
         urls = list(args.i2p)
+    elif args.auto is not None:
+        network = "auto"
+        urls = list(args.auto)
     elif mode == "fetch":
-        parser.error("one of -n/--normal, -t/--tor, -i/--i2p is required (search/crawl default to normal)")
+        parser.error("one of -n/--normal, -t/--tor, -i/--i2p, -a/--auto is required "
+                     "(search/crawl default to normal)")
     else:
         network = "normal"
         urls = []
@@ -249,6 +267,7 @@ def main(argv=None):
         rate_limit=args.rate_limit,
         no_private_ip=args.no_private_ip,
         expect=args.expect,
+        isolate=args.isolate,
     )
 
     if args.check_proxy:
@@ -258,7 +277,17 @@ def main(argv=None):
 
             sys.stdout.write(_json.dumps(result, indent=2) + "\n")
         else:
-            if result["ok"]:
+            if result.get("probes"):
+                for name, entry in result["probes"].items():
+                    if entry["ok"]:
+                        sys.stdout.write("proxy OK: %s (network=%s)\n" % (entry["proxy"], name))
+                        if entry.get("exit_ip"):
+                            sys.stdout.write("exit_ip: %s  is_tor: %s\n"
+                                             % (entry["exit_ip"], entry["is_tor"]))
+                    else:
+                        sys.stderr.write("proxy DOWN: %s (network=%s)\n"
+                                         % (entry["proxy"], name))
+            elif result["ok"]:
                 sys.stdout.write("proxy OK: %s (network=%s)\n" % (result["proxy"], result["network"]))
                 if result.get("exit_ip"):
                     sys.stdout.write("exit_ip: %s  is_tor: %s\n" % (result["exit_ip"], result["is_tor"]))
@@ -268,7 +297,7 @@ def main(argv=None):
 
     if args.verbose:
         for url in urls:
-            sys.stderr.write("[fetch] network=%s url=%s\n" % (network, url))
+            sys.stderr.write("[fetch] network=%s url=%s\n" % (network, redact_url(url)))
 
     keep_raw = fmt == "raw"
 
@@ -277,7 +306,7 @@ def main(argv=None):
 
     if mode == "crawl":
         if not urls:
-            parser.error("--follow requires a seed URL via -n/-t/-i")
+            parser.error("--follow requires a seed URL via -n/-t/-i/-a")
         return _run_crawl(args, fetcher, network, urls[0], fmt, json_mode)
 
     if len(urls) == 1:
@@ -311,6 +340,7 @@ def _run_search(args, fetcher, network, fmt, json_mode):
             args.search, top_n=top_n, network=network, backend=backend,
             search_url=search_url, fetcher=fetcher, time_range=args.time_range or "",
             concurrency=args.concurrency or config.DEFAULT_CONCURRENCY,
+            include_sponsored=args.include_sponsored,
         )
         payload = bundle
         ok = bundle["search"].ok
@@ -319,6 +349,7 @@ def _run_search(args, fetcher, network, fmt, json_mode):
         sres = search(
             args.search, network=network, backend=backend,
             search_url=search_url, fetcher=fetcher, time_range=args.time_range or "",
+            include_sponsored=args.include_sponsored,
         )
         payload = {k: v for k, v in sres.items()}
         ok = sres.ok

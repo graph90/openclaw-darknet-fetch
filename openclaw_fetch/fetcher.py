@@ -8,6 +8,7 @@ Runtime failures are returned as ``ok: false`` result dicts, never raised.
 network for a target, non-string URL).
 """
 
+import hashlib
 import json
 import os
 import random
@@ -15,8 +16,9 @@ import re
 import socket
 import threading
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse, urlsplit, urlunsplit
 
 import requests
 
@@ -25,10 +27,10 @@ from .cache import TtlCache, has_cookies
 from .errors import FetchError, error_result, exit_code_for
 from .parse import parse_document
 from .result import Result
-from .util import estimate_tokens, host_of, public_ip_addresses
+from .util import estimate_tokens, host_of, public_ip_addresses, redact_url
 
-NETWORKS = ("normal", "tor", "i2p")
-NETWORK_LABEL = {"normal": "NORMAL", "tor": "TOR", "i2p": "I2P"}
+NETWORKS = ("normal", "tor", "i2p", "auto")
+NETWORK_LABEL = {"normal": "NORMAL", "tor": "TOR", "i2p": "I2P", "auto": "AUTO"}
 
 # Retriable statuses: rate-limited (429) and server errors (5xx).
 def _retriable_status(status):
@@ -41,13 +43,12 @@ def _normalize_network(network):
         return net
     if net.upper() in NETWORK_LABEL.values():
         return net.lower()
-    raise FetchError("USAGE", "unknown network %r (expected normal/tor/i2p)" % (network,))
+    raise FetchError("USAGE", "unknown network %r (expected normal/tor/i2p/auto)" % (network,))
 
 
 def _target_tld(url):
-    try:
-        host = urlparse(url).netloc.rsplit("@", 1)[-1].split(":")[0].lower()
-    except Exception:
+    host = host_of(url)
+    if not host:
         return "clearnet"
     if host.endswith(".onion"):
         return "onion"
@@ -65,6 +66,8 @@ def _idna_host(host):
     """Punycode-normalize an IDN hostname; pass through as-is on failure."""
     import codecs
 
+    if ":" in host:
+        return host
     try:
         return codecs.encode(host, "idna").decode("ascii")
     except (UnicodeError, UnicodeDecodeError):
@@ -78,24 +81,30 @@ def validate_url(url, network=None):
     url = url.strip()
     if url.startswith(("//", "/")):
         raise FetchError("USAGE", "URL must be absolute (got %r)" % url)
-    parsed = urlparse(url)
+    try:
+        parsed = urlparse(url)
+    except ValueError as exc:
+        raise FetchError("USAGE", "invalid URL") from exc
     if not _is_http_scheme(url):
         raise FetchError(
             "SCHEME_BLOCKED",
             "only http/https are allowed (got %r)" % url.split(":", 1)[0],
         )
-    # Strip user:pass@ evidence before any output field / request.
     clean = parsed._replace(
         netloc=parsed.netloc.rsplit("@", 1)[-1],
     )
-    # Punycode IDN hostnames.
     host = _idna_host(clean.hostname or "")
-    port = clean.port
+    if not host:
+        raise FetchError("USAGE", "URL must include a hostname")
+    try:
+        port = clean.port
+    except ValueError as exc:
+        raise FetchError("USAGE", "URL has an invalid port") from exc
+    if ":" in host and not host.startswith("["):
+        host = "[%s]" % host
     netloc = host
     if port is not None:
-        netloc = "%s:%d" % (host, port)
-    if clean.username is not None and "@" in parsed.netloc:
-        netloc = netloc  # already stripped
+        netloc += ":%d" % port
     clean = clean._replace(netloc=netloc)
     return clean.geturl()
 
@@ -110,9 +119,22 @@ def route_error(url):
     return None, None
 
 
+def resolve_network(network, url):
+    """Concrete network for ``url``: ``auto`` follows the target's suffix."""
+    net = _normalize_network(network)
+    if net != "auto":
+        return net
+    tld = _target_tld(url)
+    if tld == "onion":
+        return "tor"
+    if tld == "i2p":
+        return "i2p"
+    return "normal"
+
+
 def check_route(network, url):
     """Return (error_code, message) when ``network`` cannot reach ``url``."""
-    net = _normalize_network(network)
+    net = resolve_network(network, url)
     tld = _target_tld(url)
     if net == "normal":
         return route_error(url)
@@ -121,6 +143,41 @@ def check_route(network, url):
     if net == "i2p" and tld == "onion":
         return "NETWORK_MISMATCH", "Tor onion services cannot be reached over I2P: use network='tor' (-t)"
     return None, None
+
+
+_REDIRECT_STATUSES = {301, 302, 303, 307, 308}
+_SENSITIVE_REDIRECT_HEADERS = {
+    "authorization",
+    "proxy-authorization",
+    "cookie",
+    "host",
+    "x-api-key",
+    "x-auth-token",
+    "x-access-token",
+}
+
+
+def _origin(url):
+    parsed = urlparse(url)
+    scheme = parsed.scheme.lower()
+    host = (parsed.hostname or "").lower()
+    port = parsed.port
+    if port is None:
+        port = 443 if scheme == "https" else 80
+    return scheme, host, port
+
+
+def _redirect_headers(headers, source, target):
+    result = dict(headers or {})
+    if _origin(source) != _origin(target):
+        for key in list(result):
+            if key.lower() in _SENSITIVE_REDIRECT_HEADERS:
+                result.pop(key, None)
+    return result
+
+
+def _is_redirect_response(resp):
+    return resp.status_code in _REDIRECT_STATUSES and bool(resp.headers.get("Location"))
 
 
 class _CookieStore:
@@ -304,13 +361,18 @@ class Fetcher:
         rate_limit=None,
         no_private_ip=False,
         expect=None,
+        isolate=None,
     ):
         opts = config.resolve({})
         self.network = _normalize_network(network)
         self.tor_proxy = tor_proxy or os.environ.get("OPENCLAW_TOR_PROXY") or opts.get("tor_proxy", config.TOR_PROXY_DEFAULT)
         self.i2p_proxy = i2p_proxy or os.environ.get("OPENCLAW_I2P_PROXY") or opts.get("i2p_proxy", config.I2P_PROXY_DEFAULT)
+        self._timeout_explicit = timeout is not None
+        self._connect_timeout_explicit = connect_timeout is not None
         self.timeout = timeout if timeout is not None else opts.get("timeout", config.DEFAULT_TIMEOUT)
         self.connect_timeout = connect_timeout if connect_timeout is not None else opts.get("connect_timeout", config.DEFAULT_CONNECT_TIMEOUT)
+        self.isolate = bool(opts.get("isolate", config.DEFAULT_ISOLATE)) if isolate is None else bool(isolate)
+
         self.retries = retries if retries is not None else opts.get("retries", config.DEFAULT_RETRIES)
         self.retry_backoff = retry_backoff if retry_backoff is not None else opts.get("retry_backoff", config.DEFAULT_RETRY_BACKOFF)
         self.cookie_jar = cookie_jar
@@ -318,6 +380,7 @@ class Fetcher:
         self.max_links = max_links if max_links is not None else opts.get("max_links", config.DEFAULT_MAX_LINKS)
         self.max_chars = max_chars if max_chars is not None else opts.get("max_chars", config.DEFAULT_MAX_CHARS)
         self.max_redirects = max_redirects if max_redirects is not None else opts.get("max_redirects", config.DEFAULT_MAX_REDIRECTS)
+        self.max_redirects = max(0, int(self.max_redirects))
         self.allow_errors = allow_errors
         self.respect_robots = respect_robots
         self.rate_limit = rate_limit
@@ -333,138 +396,314 @@ class Fetcher:
         self._jar = _CookieStore(cookie_jar)
         ttl = cache_ttl if cache_ttl is not None else opts.get("cache_ttl", config.DEFAULT_CACHE_TTL)
         self.cache = TtlCache(cache_dir=cache_dir, ttl=ttl, enabled=use_cache)
-        # Auth edge case: once a non-empty jar exists, stop using the disk cache
-        # so authenticated responses can never leak to other contexts.
-        self._cache_safe = use_cache and not has_cookies(cookie_jar)
+        self._cache_safe = bool(use_cache)
 
     # -- sessions ---------------------------------------------------------
-    def _session(self):
-        session = getattr(self._local, "session", None)
+    def _session(self, network=None):
+        net = network or self.network
+        sessions = getattr(self._local, "sessions", None)
+        if sessions is None:
+            sessions = {}
+            self._local.sessions = sessions
+        session = sessions.get(net)
         if session is None:
-            session = self._new_session()
-            self._local.session = session
+            session = self._new_session(net)
+            sessions[net] = session
         return session
 
-    def _new_session(self):
+    def _new_session(self, network=None):
+        net = network or self.network
         session = requests.Session()
         session.max_redirects = self.max_redirects
-        if self.network != "normal":
+        if net != "normal":
             session.trust_env = False
-        if self.network == "tor":
-            proxy = self.tor_proxy
-        elif self.network == "i2p":
-            proxy = self.i2p_proxy
-        else:
-            proxy = None
+        proxy = self.proxy_url(net)
         if proxy:
             session.proxies = {"http": proxy, "https": proxy}
         self._jar.load(session)
         return session
 
-    def proxy_url(self):
-        if self.network == "tor":
+    def proxy_url(self, network=None):
+        """Configured proxy for ``network``, without isolation credentials."""
+        net = network or self.network
+        if net == "tor":
             return self.tor_proxy
-        if self.network == "i2p":
+        if net == "i2p":
             return self.i2p_proxy
         return None
 
+    def _isolated_proxy(self, network=None, tag=""):
+        """Return the proxy URL to dial for one request.
+
+        Tor isolates streams by SOCKS credentials (``IsolateSOCKSAuth``), so a
+        unique user/password per request puts every request on its own circuit.
+        ``tag`` lets a retry ask for a different circuit.
+        """
+        net = network or self.network
+        proxy = self.proxy_url(net)
+        if not proxy or net != "tor" or not self.isolate:
+            return proxy
+        parts = urlsplit(proxy)
+        if not parts.scheme or not parts.hostname:
+            return proxy
+        user = "isolate-%s" % uuid.uuid4().hex[:12]
+        credentials = "%s:%s" % (user, uuid.uuid4().hex[:8])
+        if tag:
+            credentials = "%s-%s" % (credentials, tag)
+        host = parts.hostname
+        if ":" in host and not host.startswith("["):
+            host = "[%s]" % host
+        netloc = "%s@%s" % (credentials, host)
+        if parts.port:
+            netloc += ":%d" % parts.port
+        return urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
+
+    def _has_cookies(self):
+        if has_cookies(self.cookie_jar):
+            return True
+        try:
+            return bool(self._session().cookies)
+        except Exception:
+            return True
+
+    def _cache_allowed(self, headers=None):
+        if not self._cache_safe or self._has_cookies():
+            return False
+        for key in headers or {}:
+            if key.lower() in _SENSITIVE_REDIRECT_HEADERS:
+                return False
+        return True
+
+    def _cache_context(self, method, headers, allow_errors, network=None):
+        payload = {
+            "method": str(method).upper(),
+            "headers": sorted(
+                (str(key).lower(), str(value))
+                for key, value in (headers or {}).items()
+            ),
+            "proxy": self.proxy_url(network) or "",
+            "expect": self.expect or "",
+            "allow_errors": bool(allow_errors),
+        }
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    def _network_for(self, url):
+        """Concrete network for ``url`` (``auto`` follows the target suffix)."""
+        return resolve_network(self.network, url)
+
+    def _validate_target(self, url):
+        clean_url = validate_url(url, self.network)
+        net = resolve_network(self.network, clean_url)
+        code, message = check_route(net, clean_url)
+        if code:
+            raise FetchError(code, message)
+        if self.no_private_ip and net == "normal":
+            host = host_of(clean_url)
+            if not host:
+                raise FetchError("HOST_BLOCKED", "target has no hostname")
+            _, is_private, err = public_ip_addresses(host)
+            if err:
+                raise FetchError("HOST_BLOCKED", "cannot resolve %r: %s" % (host, err))
+            if is_private:
+                raise FetchError(
+                    "HOST_BLOCKED",
+                    "target %r resolves to a private/loopback address" % host,
+                )
+        return clean_url
+
     # -- request loop -----------------------------------------------------
-    def _request(self, method, url, **request_kw):
-        """Run the request with retries. Returns (response, error) tuple."""
-        session = self._session()
+    def _request(self, method, url, network=None, **request_kw):
+        """Run a request with bounded retries and validated redirects."""
+        current_method = str(method).upper()
+        current_url = url
+        current_net = network or self.network
+        current_kw = dict(request_kw)
+        history = []
+        for redirect_count in range(self.max_redirects + 1):
+            try:
+                current_url = self._validate_target(current_url)
+                current_net = self._network_for(current_url)
+            except FetchError as exc:
+                return None, (exc.error_code, str(exc))
+            resp, req_error = self._request_once(
+                current_method, current_url, network=current_net, **current_kw
+            )
+            if req_error:
+                return None, req_error
+            if not _is_redirect_response(resp):
+                resp.history = history
+                return resp, None
+            location = resp.headers.get("Location")
+            if redirect_count >= self.max_redirects:
+                resp.close()
+                return None, ("REQUEST", "too many redirects")
+            try:
+                next_url = self._validate_target(urljoin(current_url, location))
+            except FetchError as exc:
+                resp.close()
+                return None, (exc.error_code, str(exc))
+            redirect_status = resp.status_code
+            if (
+                redirect_status in (307, 308)
+                and _origin(current_url) != _origin(next_url)
+                and (
+                    current_kw.get("data") is not None
+                    or current_kw.get("json") is not None
+                )
+            ):
+                resp.close()
+                return None, (
+                    "REQUEST",
+                    "cross-origin redirect with a request body was blocked",
+                )
+            history.append(resp)
+            resp.close()
+            current_kw["headers"] = _redirect_headers(
+                current_kw.get("headers"), current_url, next_url
+            )
+            if (redirect_status == 303 and current_method != "HEAD") or (
+                redirect_status in (301, 302)
+                and current_method not in ("GET", "HEAD")
+            ):
+                current_method = "GET"
+                current_kw.pop("data", None)
+                current_kw.pop("json", None)
+                current_kw["headers"] = {
+                    key: value
+                    for key, value in current_kw["headers"].items()
+                    if key.lower() not in ("content-length", "content-type", "transfer-encoding")
+                }
+            current_url = next_url
+        return None, ("REQUEST", "too many redirects")
+
+    def _timeouts(self, url):
+        """Per-request ``(connect, read)`` timeouts, widened for darknet hosts.
+
+        Onion and I2P targets pay for service-descriptor fetches and tunnel
+        setup before the first byte, which the clearnet connect timeout treats
+        as a failure. Explicit constructor values always win.
+        """
+        connect, read = self.connect_timeout, self.timeout
+        if _target_tld(url) not in ("onion", "i2p"):
+            return connect, read
+        if not self._connect_timeout_explicit:
+            connect = max(connect, config.DARKNET_CONNECT_TIMEOUT)
+        if not self._timeout_explicit:
+            read = max(read, config.DARKNET_TIMEOUT)
+        return connect, read
+
+    def _request_once(self, method, url, network=None, **request_kw):
+        net = network or self.network
+        session = self._session(net)
         if self._rate is not None:
             self._rate.wait()
         attempts = self.retries + 1
-        last_error = None
-        last_response = None
+        can_retry = method in ("GET", "HEAD", "OPTIONS")
         for attempt in range(attempts):
             try:
+                request_options = dict(request_kw)
+                if net == "tor" and self.isolate:
+                    isolated = self._isolated_proxy(net, tag="r%d" % attempt)
+                    request_options["proxies"] = {"http": isolated, "https": isolated}
                 resp = session.request(
                     method,
                     url,
-                    timeout=(self.connect_timeout, self.timeout),
+                    timeout=self._timeouts(url),
                     stream=True,
-                    **request_kw,
+                    allow_redirects=False,
+                    **request_options,
                 )
+
                 if not _retriable_status(resp.status_code):
                     return resp, None
-                last_response = resp
-                if attempt == attempts - 1:
+                if not can_retry or attempt == attempts - 1:
                     return resp, None
                 delay = self._backoff(attempt)
                 retry_after = _retry_after_seconds(resp)
                 if retry_after is not None:
                     delay = max(delay, min(retry_after, 30))
+                resp.close()
                 time.sleep(delay)
             except requests.exceptions.ProxyError:
-                if attempt == attempts - 1:
-                    return None, ("PROXY_DOWN", "could not connect to %s proxy at %s" % (self.network, self.proxy_url()))
+                if not can_retry or attempt == attempts - 1:
+                    return None, (
+                        "PROXY_DOWN",
+                        "could not connect to %s proxy at %s"
+                        % (net, redact_url(self.proxy_url(net))),
+                    )
                 time.sleep(self._backoff(attempt))
             except requests.exceptions.Timeout:
-                if attempt == attempts - 1:
+                if not can_retry or attempt == attempts - 1:
                     return None, ("TIMEOUT", "request timed out")
                 time.sleep(self._backoff(attempt))
             except requests.exceptions.TooManyRedirects:
                 return None, ("REQUEST", "too many redirects")
             except requests.exceptions.ConnectionError:
-                if attempt == attempts - 1:
+                if not can_retry or attempt == attempts - 1:
                     return None, ("CONNECTION", "connection failed")
                 time.sleep(self._backoff(attempt))
             except requests.exceptions.RequestException as exc:
                 return None, ("REQUEST", str(exc))
-        return last_response, last_error
+        return None, ("REQUEST", "request failed")
 
     def _backoff(self, attempt):
         base = self.retry_backoff * (2 ** attempt)
         return base * (0.5 + random.random())
 
     # -- body / decode ----------------------------------------------------
-    def _read_and_decode(self, resp, requested_url):
-        headers = resp.headers
-        content_length = headers.get("Content-Length")
-        if content_length:
+    def _read_and_decode(self, resp, requested_url, network=None):
+        label = NETWORK_LABEL[network] if network in NETWORK_LABEL else NETWORK_LABEL[
+            resolve_network(self.network, requested_url)
+        ]
+        try:
+            headers = resp.headers
+            content_length = headers.get("Content-Length")
+            if content_length:
+                try:
+                    if int(content_length) > self.max_bytes:
+                        return None, None, error_result(
+                            "BODY_TOO_LARGE",
+                            "Content-Length %s exceeds max-bytes %d" % (content_length, self.max_bytes),
+                            requested_url=requested_url,
+                            network=label,
+                            status=resp.status_code,
+                        )
+                except (TypeError, ValueError):
+                    pass
+            chunks = []
+            total = 0
             try:
-                if int(content_length) > self.max_bytes:
-                    return None, None, error_result(
-                        "BODY_TOO_LARGE",
-                        "Content-Length %s exceeds max-bytes %d" % (content_length, self.max_bytes),
-                        requested_url=requested_url,
-                        network=NETWORK_LABEL[self.network],
-                        status=resp.status_code,
-                    )
-            except (TypeError, ValueError):
-                pass
-        chunks = []
-        total = 0
-        try:
-            for chunk in resp.iter_content(chunk_size=65536):
-                total += len(chunk)
-                if total > self.max_bytes:
-                    return None, None, error_result(
-                        "BODY_TOO_LARGE",
-                        "body exceeds max-bytes %d during streaming" % self.max_bytes,
-                        requested_url=requested_url,
-                        network=NETWORK_LABEL[self.network],
-                        status=resp.status_code,
-                    )
-                chunks.append(chunk)
-        except requests.exceptions.ChunkedEncodingError:
-            return None, None, error_result(
-                "CONNECTION",
-                "connection lost while reading body",
-                requested_url=requested_url,
-                network=NETWORK_LABEL[self.network],
-                status=resp.status_code,
-            )
-        body = b"".join(chunks)
-        encoding = requests.utils.get_encoding_from_headers(headers)
-        if not encoding:
-            encoding = _apparent_encoding(body)
-        try:
-            text = body.decode(encoding, errors="replace")
-        except (LookupError, TypeError):
-            text = body.decode("utf-8", errors="replace")
-        return body, text, None
+                for chunk in resp.iter_content(chunk_size=65536):
+                    total += len(chunk)
+                    if total > self.max_bytes:
+                        return None, None, error_result(
+                            "BODY_TOO_LARGE",
+                            "body exceeds max-bytes %d during streaming" % self.max_bytes,
+                            requested_url=requested_url,
+                            network=label,
+                            status=resp.status_code,
+                        )
+                    chunks.append(chunk)
+            except requests.exceptions.RequestException:
+                return None, None, error_result(
+                    "CONNECTION",
+                    "connection lost while reading body",
+                    requested_url=requested_url,
+                    network=label,
+                    status=resp.status_code,
+                )
+            body = b"".join(chunks)
+            encoding = requests.utils.get_encoding_from_headers(headers)
+            if not encoding:
+                encoding = _apparent_encoding(body)
+            try:
+                text = body.decode(encoding, errors="replace")
+            except (LookupError, TypeError):
+                text = body.decode("utf-8", errors="replace")
+            return body, text, None
+        finally:
+            resp.close()
 
     # -- public API -------------------------------------------------------
     def fetch(self, url, method="GET", *, data=None, form=True, headers=None, allow_errors=None, keep_raw=False,
@@ -473,57 +712,46 @@ class Fetcher:
         t0 = time.monotonic()
         eff_allow_errors = self.allow_errors if allow_errors is None else allow_errors
         try:
-            clean_url = validate_url(url, self.network)
+            clean_url = self._validate_target(url)
         except FetchError as exc:
+            safe_url = redact_url(url) if isinstance(url, str) else url
             result = error_result(
-                exc.error_code, str(exc), requested_url=url, network=NETWORK_LABEL[self.network]
+                exc.error_code, str(exc), requested_url=safe_url,
+                network=NETWORK_LABEL[NETWORK_LABEL.get(self.network, self.network).lower()],
             )
             result["took_ms"] = int((time.monotonic() - t0) * 1000)
             return result
-        code, message = check_route(self.network, clean_url)
-        if code:
-            result = error_result(code, message, requested_url=clean_url, network=NETWORK_LABEL[self.network])
-            result["took_ms"] = int((time.monotonic() - t0) * 1000)
-            return result
+        net = self._network_for(clean_url)
+        label = NETWORK_LABEL[net]
 
-        # -- safety guards -------------------------------------------------
-        if not _skip_guards:
-            if self.no_private_ip and self.network == "normal":
-                host = host_of(clean_url)
-                if host:
-                    _, is_private, err = public_ip_addresses(host)
-                    if err:
-                        result = error_result(
-                            "HOST_BLOCKED", "cannot resolve %r: %s" % (host, err),
-                            requested_url=clean_url, network=NETWORK_LABEL[self.network],
-                        )
-                        result["took_ms"] = int((time.monotonic() - t0) * 1000)
-                        return result
-                    if is_private:
-                        result = error_result(
-                            "HOST_BLOCKED",
-                            "target %r resolves to a private/loopback address (use --no-private-ip only for public targets)" % host,
-                            requested_url=clean_url, network=NETWORK_LABEL[self.network],
-                        )
-                        result["took_ms"] = int((time.monotonic() - t0) * 1000)
-                        return result
-        if not _skip_guards and self._robots is not None and method == "GET" and not data:
+        if not _skip_guards and self._robots is not None and method == "GET" and data is None:
             if not self._robots.allowed(clean_url):
                 result = error_result(
                     "ROBOTS_BLOCKED", "blocked by robots.txt", requested_url=clean_url,
-                    network=NETWORK_LABEL[self.network],
+                    network=label,
                 )
                 result["took_ms"] = int((time.monotonic() - t0) * 1000)
                 return result
 
-        use_cache = self._cache_safe and method == "GET" and not data
-        if use_cache:
-            cached = self.cache.get(self.network, clean_url)
-            if cached is not None:
-                return self._from_cache(cached, clean_url, t0, keep_raw=keep_raw)
-
         request_headers = dict(self.headers)
         request_headers.update(headers or {})
+        use_cache = (
+            self._cache_allowed(request_headers)
+            and method == "GET"
+            and data is None
+        )
+        cache_context = self._cache_context(method, request_headers, eff_allow_errors, net)
+        if use_cache:
+            cached = self.cache.get(
+                net, clean_url, context=cache_context,
+                max_bytes=self.max_bytes,
+            )
+            if cached is not None:
+                return self._from_cache(
+                    cached, clean_url, t0, keep_raw=keep_raw,
+                    allow_errors=eff_allow_errors, network=net,
+                )
+
         if data is not None and not form:
             request_headers.setdefault("Content-Type", "application/json")
             kwargs = {"data": data}
@@ -531,19 +759,19 @@ class Fetcher:
             kwargs = {"data": data}
         else:
             kwargs = {}
-        resp, req_error = self._request(method, clean_url, headers=request_headers, **kwargs)
+        resp, req_error = self._request(
+            method, clean_url, network=net, headers=request_headers, **kwargs
+        )
         took = int((time.monotonic() - t0) * 1000)
 
         if req_error:
             code, message = req_error
-            result = error_result(code, message, requested_url=clean_url, network=NETWORK_LABEL[self.network])
+            result = error_result(code, message, requested_url=clean_url, network=label)
             result["took_ms"] = took
-            if self.respect_robots and method == "GET":
-                self.cache.put(self.network, clean_url, None, clean_url, "", b"")
             return result
 
-        body, text, read_error = self._read_and_decode(resp, clean_url)
-        final_url = resp.url
+        body, text, read_error = self._read_and_decode(resp, clean_url, net)
+        final_url = redact_url(resp.url)
         if read_error:
             read_error["took_ms"] = took
             read_error["final_url"] = final_url
@@ -573,7 +801,7 @@ class Fetcher:
             ok=ok,
             error="" if ok else expect_error or "HTTP %d %s" % (resp.status_code, _reason(resp.status_code)),
             error_code="HTTP" if not ok and not expect_error else ("EXPECT_MISMATCH" if expect_error else None),
-            network=NETWORK_LABEL[self.network],
+            network=label,
             requested_url=clean_url,
             final_url=final_url,
             status=resp.status_code,
@@ -599,27 +827,36 @@ class Fetcher:
             cached=False,
             target_tld=_target_tld(clean_url),
             redirects=len(resp.history),
-            redirect_chain=[r.url for r in resp.history] + [final_url],
-            proxy_used=self.proxy_url() or None,
+            redirect_chain=[redact_url(r.url) for r in resp.history] + [final_url],
+            proxy_used=redact_url(self.proxy_url(net)) or None,
         )
+        if self.isolate and net == "tor":
+            result["metadata"]["isolated"] = True
         if expect_error and not eff_allow_errors:
             result["error"] = expect_error
         if not ok:
             result["error_code"] = result["error_code"] or "HTTP"
             result["error"] = result["error"] or "HTTP %d %s" % (resp.status_code, _reason(resp.status_code))
-        if self._cache_safe and method == "GET" and ok and not resp.history:
+        self._jar.save(self._session())
+        if (
+            self._cache_allowed(request_headers)
+            and method == "GET"
+            and data is None
+            and ok
+            and not resp.history
+        ):
             self.cache.put(
-                self.network,
+                net,
                 clean_url,
                 resp.status_code,
                 final_url,
                 content_type,
                 body,
                 headers=dict(resp.headers),
+                context=cache_context,
             )
         if keep_raw:
             result["_raw_body"] = text
-        self._jar.save(self._session())
         return result
 
     def post(self, url, *, data=None, form=True, headers=None, keep_raw=False, **kwargs):
@@ -631,14 +868,39 @@ class Fetcher:
         return self.fetch(url, method="POST", data=data, form=form, headers=headers, keep_raw=keep_raw, **kwargs)
 
     def check_proxy(self):
-        """Probe the configured network/proxy and report reachability."""
+        """Probe the configured network/proxy and report reachability.
+
+        ``network="auto"`` probes every network and returns one entry per
+        network under ``probes``.
+        """
         probes = {
             "tor": "http://check.torproject.org/api/ip",
             "i2p": "http://i2p-projekt.i2p/",
             "normal": "https://example.com/",
         }
+        if self.network == "auto":
+            per_network = {
+                name: self.check_proxy_for(name) for name in ("normal", "tor", "i2p")
+            }
+            return {
+                "ok": any(entry["ok"] for entry in per_network.values()),
+                "network": "AUTO",
+                "probes": per_network,
+                "tor_proxy": redact_url(self.tor_proxy),
+                "i2p_proxy": redact_url(self.i2p_proxy),
+            }
+        return self.check_proxy_for(self.network)
+
+    def check_proxy_for(self, network):
+        """Probe one concrete network and report reachability."""
+        probes = {
+            "tor": "http://check.torproject.org/api/ip",
+            "i2p": "http://i2p-projekt.i2p/",
+            "normal": "https://example.com/",
+        }
+        net = _normalize_network(network)
         small = Fetcher(
-            network=self.network,
+            network=net,
             tor_proxy=self.tor_proxy,
             i2p_proxy=self.i2p_proxy,
             timeout=max(8, self.timeout),
@@ -646,17 +908,18 @@ class Fetcher:
             retry_backoff=0.2,
             use_cache=False,
             max_bytes=65536,
+            isolate=self.isolate,
         )
-        result = small.fetch(probes[self.network])
+        result = small.fetch(probes[net], _skip_guards=True)
         out = {
             "ok": result["ok"],
             "network": result["network"],
             "status": result.get("status"),
             "error": result.get("error"),
             "error_code": result.get("error_code"),
-            "proxy": self.proxy_url(),
+            "proxy": redact_url(self.proxy_url(net)),
         }
-        if self.network == "tor" and result["ok"] and isinstance(result.get("text"), str):
+        if net == "tor" and result["ok"] and isinstance(result.get("text"), str):
             try:
                 payload = json.loads(result["text"])
                 out["exit_ip"] = payload.get("IP")
@@ -678,14 +941,18 @@ class Fetcher:
             return "expected content kind %r but got %r (server replied with a different content-type)" % (want, kind)
         return ""
 
-    def _from_cache(self, cached, url, t0, keep_raw=False):
+    def _from_cache(self, cached, url, t0, keep_raw=False, allow_errors=None,
+                    network=None):
         meta, body = cached["meta"], cached["body"]
+        net = network or meta.get("network") or self.network
+        eff_allow_errors = self.allow_errors if allow_errors is None else allow_errors
         content_type = meta.get("content_type") or ""
+        final_url = redact_url(meta.get("final_url") or url)
         kind = parse_document(
             body.decode("utf-8", errors="replace"),
             content_type=content_type,
             requested_url=url,
-            final_url=meta.get("final_url") or url,
+            final_url=final_url,
             source_len=len(body),
             max_links=self.max_links,
             raw_body=body,
@@ -693,14 +960,28 @@ class Fetcher:
         rendered_text = _truncate(kind["text"], self.max_chars, "text")
         rendered_markdown = _truncate(kind["markdown"], self.max_chars, "text")
         status = meta.get("status")
-        ok = status is not None and status < 400
+        expect_error = self._expect_check(kind["kind"])
+        ok = status is not None and (status < 400 or eff_allow_errors)
+        if expect_error and not eff_allow_errors:
+            ok = False
+        if status is None:
+            error = "cached response has no status"
+        elif expect_error and not eff_allow_errors:
+            error = expect_error
+        else:
+            error = "" if ok else "HTTP %s (from cache)" % status
+        error_code = None
+        if expect_error and not eff_allow_errors:
+            error_code = "EXPECT_MISMATCH"
+        elif not ok:
+            error_code = "HTTP"
         result = Result(
             ok=ok,
-            error="" if ok else "HTTP %d (from cache)" % status,
-            error_code=None if ok else "HTTP",
-            network=NETWORK_LABEL[self.network],
+            error=error,
+            error_code=error_code,
+            network=NETWORK_LABEL[net],
             requested_url=url,
-            final_url=meta.get("final_url") or url,
+            final_url=final_url,
             status=status,
             content_type=content_type,
             content_length=len(body),
@@ -725,7 +1006,7 @@ class Fetcher:
             target_tld=_target_tld(url),
             redirects=0,
             redirect_chain=[],
-            proxy_used=self.proxy_url() or None,
+            proxy_used=redact_url(self.proxy_url(net)) or None,
         )
         if keep_raw:
             result["_raw_body"] = body.decode("utf-8", errors="replace")

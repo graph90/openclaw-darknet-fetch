@@ -22,13 +22,38 @@ def estimate_tokens(text):
 
 def host_of(url):
     """Return the lowercase host of ``url`` (without port/user) or ``None``."""
-    from urllib.parse import urlparse
+    from urllib.parse import urlsplit
 
     try:
-        host = urlparse(url).netloc.rsplit("@", 1)[-1].split(":")[0].lower()
-    except Exception:
+        host = urlsplit(url).hostname
+    except (TypeError, ValueError):
         return None
-    return host or None
+    return host.lower() if host else None
+
+
+def redact_url(url):
+    """Remove URL userinfo and return a safe URL for logs/results."""
+    from urllib.parse import urlsplit, urlunsplit
+
+    if not isinstance(url, str):
+        return ""
+    try:
+        parts = urlsplit(url)
+        if not parts.netloc:
+            return url
+        host = parts.hostname or ""
+        if ":" in host and not host.startswith("["):
+            host = "[%s]" % host
+        port = parts.port
+        netloc = host
+        if port is not None and not (
+            (parts.scheme.lower() == "http" and port == 80)
+            or (parts.scheme.lower() == "https" and port == 443)
+        ):
+            netloc += ":%d" % port
+        return urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
+    except (TypeError, ValueError):
+        return "<invalid-url>"
 
 
 def public_ip_addresses(host):

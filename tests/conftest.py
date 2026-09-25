@@ -63,6 +63,12 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Location", "/")
             self.send_header("Content-Length", "0")
             self.end_headers()
+        elif path == "/redirect307":
+            port = self.server.server_address[1]
+            self.send_response(307)
+            self.send_header("Location", "http://localhost:%d/echo" % port)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
         elif path == "/json":
             payload = json.dumps({"hello": "world", "n": 42}).encode("utf-8")
             self._send(200, "application/json; charset=utf-8", payload)
@@ -116,8 +122,16 @@ class Handler(BaseHTTPRequestHandler):
             self._send(404, "text/plain; charset=utf-8", b"no route")
 
     def do_POST(self):
+        path = self.path.split("?")[0]
         length = int(self.headers.get("Content-Length") or 0)
         raw = self.rfile.read(length) if length else b""
+        if path == "/redirect307":
+            port = self.server.server_address[1]
+            self.send_response(307)
+            self.send_header("Location", "http://localhost:%d/echo" % port)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         content_type = self.headers.get("Content-Type", "")
         try:
             body = json.loads(raw.decode("utf-8"))

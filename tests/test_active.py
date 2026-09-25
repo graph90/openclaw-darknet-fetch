@@ -257,3 +257,115 @@ class TestCliNew:
         data = json.loads(p.stdout)
         assert "seed_url" in data
         assert data["pages_fetched"] == 1
+
+
+class TestMcpDefaults:
+    def test_server_network_and_max_chars_defaults(self, monkeypatch):
+        import sys
+        import types
+
+        from openclaw_fetch.mcp_server import _build_server
+        from openclaw_fetch.result import Result
+
+        calls = []
+
+        class FakeFetcher:
+            def __init__(self, **kwargs):
+                calls.append(kwargs)
+
+            def fetch(self, url, **kwargs):
+                return Result(ok=True, text="ok", markdown="# ok")
+
+            def fetch_many(self, urls, concurrency=4):
+                return [self.fetch(url) for url in urls]
+
+        class FakeMCP:
+            def __init__(self, name):
+                self.name = name
+                self.tools = {}
+
+            def tool(self):
+                def decorate(fn):
+                    self.tools[fn.__name__] = fn
+                    return fn
+
+                return decorate
+
+        fastmcp = types.ModuleType("mcp.server.fastmcp")
+        fastmcp.FastMCP = FakeMCP
+        server_module = types.ModuleType("mcp.server")
+        server_module.fastmcp = fastmcp
+        mcp_module = types.ModuleType("mcp")
+        mcp_module.server = server_module
+        monkeypatch.setitem(sys.modules, "mcp", mcp_module)
+        monkeypatch.setitem(sys.modules, "mcp.server", server_module)
+        monkeypatch.setitem(sys.modules, "mcp.server.fastmcp", fastmcp)
+        monkeypatch.setattr("openclaw_fetch.fetcher.Fetcher", FakeFetcher)
+
+        server = _build_server(network="tor", max_chars=321)
+        server.tools["fetch"]("https://example.test")
+        assert calls[-1]["network"] == "tor"
+        assert calls[-1]["max_chars"] == 321
+        assert calls[-1]["no_private_ip"] is True
+
+        server.tools["fetch_many"](["https://example.test"])
+        assert calls[-1]["max_chars"] == 321
+
+        server.tools["fetch"]("https://example.test", network="normal")
+        assert calls[-1]["network"] == "normal"
+
+    def test_server_network_auto_and_isolate(self, monkeypatch):
+        import sys
+        import types
+
+        from openclaw_fetch.mcp_server import _build_server
+        from openclaw_fetch.result import Result
+
+        calls = []
+
+        class FakeFetcher:
+            def __init__(self, **kwargs):
+                calls.append(kwargs)
+
+            def fetch(self, url, **kwargs):
+                return Result(ok=True, text="ok", markdown="# ok")
+
+            def fetch_many(self, urls, concurrency=4):
+                return [self.fetch(url) for url in urls]
+
+            def check_proxy(self):
+                return {"ok": True, "network": "AUTO", "probes": {}}
+
+        class FakeMCP:
+            def __init__(self, name):
+                self.name = name
+                self.tools = {}
+
+            def tool(self):
+                def decorate(fn):
+                    self.tools[fn.__name__] = fn
+                    return fn
+
+                return decorate
+
+        fastmcp = types.ModuleType("mcp.server.fastmcp")
+        fastmcp.FastMCP = FakeMCP
+        server_module = types.ModuleType("mcp.server")
+        server_module.fastmcp = fastmcp
+        mcp_module = types.ModuleType("mcp")
+        mcp_module.server = server_module
+        monkeypatch.setitem(sys.modules, "mcp", mcp_module)
+        monkeypatch.setitem(sys.modules, "mcp.server", server_module)
+        monkeypatch.setitem(sys.modules, "mcp.server.fastmcp", fastmcp)
+        monkeypatch.setattr("openclaw_fetch.fetcher.Fetcher", FakeFetcher)
+
+        server = _build_server(network="normal")
+        server.tools["fetch"]("http://example.onion.test", network="auto")
+        assert calls[-1]["network"] == "auto"
+        assert calls[-1]["no_private_ip"] is True
+
+        server.tools["fetch"]("https://example.test", isolate=False)
+        assert calls[-1]["isolate"] is False
+
+        out = server.tools["proxy_status"](network="auto")
+        assert out["network"] == "AUTO"

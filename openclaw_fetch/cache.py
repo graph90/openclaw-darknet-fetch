@@ -1,6 +1,6 @@
 """TTL disk cache with atomic writes.
 
-Key = ``sha256("network|url")``. Two files per entry:
+Key = ``sha256("network|url|context")``. Two files per entry:
 ``<key>.json`` (meta) and ``<key>.body`` (raw response bytes).
 Writes are atomic via ``os.replace`` so concurrent batch fetches never
 observe a torn entry.
@@ -20,12 +20,15 @@ class TtlCache:
         self.enabled = enabled
 
     @staticmethod
-    def key_for(network, url):
-        """Derive the opaque cache key for ``network|url``."""
+    def key_for(network, url, context=None):
+        """Derive the opaque cache key for a request and its context."""
         digest = hashlib.sha256()
         digest.update(str(network).encode("utf-8"))
         digest.update(b"|")
         digest.update(str(url).encode("utf-8"))
+        if context is not None:
+            digest.update(b"|context|")
+            digest.update(str(context).encode("utf-8"))
         return digest.hexdigest()
 
     def _paths(self, key):
@@ -37,11 +40,11 @@ class TtlCache:
             base = self.cache_dir
         return os.path.join(base, key + ".json"), os.path.join(base, key + ".body")
 
-    def get(self, network, url):
+    def get(self, network, url, context=None, max_bytes=None):
         """Return cached meta+body or ``None``. Expired entries are purged."""
         if not self.enabled:
             return None
-        key = self.key_for(network, url)
+        key = self.key_for(network, url, context=context)
         meta_path, body_path = self._paths(key)
         try:
             with open(meta_path, "r", encoding="utf-8") as fh:
@@ -50,36 +53,49 @@ class TtlCache:
             if self.ttl is not None and self.ttl >= 0 and time.time() - fetched > self.ttl:
                 self._remove(key)
                 return None
+            if meta.get("url") != url or meta.get("network") != network:
+                self._remove(key)
+                return None
+            if context is not None and meta.get("context") != context:
+                self._remove(key)
+                return None
+            if max_bytes is not None and os.path.getsize(body_path) > max_bytes:
+                self._remove(key)
+                return None
             with open(body_path, "rb") as fh:
                 body = fh.read()
         except (OSError, ValueError, KeyError):
             return None
-        if meta.get("url") != url or meta.get("network") != network:
+        body_digest = meta.get("body_sha256")
+        if body_digest and body_digest != hashlib.sha256(body).hexdigest():
             self._remove(key)
             return None
         return {"meta": meta, "body": body}
 
-    def put(self, network, url, status, final_url, content_type, content, headers=None):
+    def put(self, network, url, status, final_url, content_type, content, headers=None,
+            context=None):
         """Store an entry. ``status``/``final_url`` may be ``None`` for errors."""
         if not self.enabled:
             return None
-        key = self.key_for(network, url)
+        key = self.key_for(network, url, context=context)
         meta_path, body_path = self._paths(key)
+        body = b"" if content is None else content
         meta = {
             "key": key,
             "network": network,
             "url": url,
+            "context": context,
             "fetch_time": time.time(),
             "status": status,
             "final_url": final_url,
             "content_type": content_type,
-            "content_length": len(content) if content is not None else 0,
+            "content_length": len(body),
             "headers": headers,
+            "body_sha256": hashlib.sha256(body).hexdigest(),
         }
         os.makedirs(self.cache_dir or meta_path.rsplit(os.sep, 1)[0], exist_ok=True)
+        self._atomic_write_bytes(body_path, body)
         self._atomic_write_json(meta_path, meta)
-        if content is not None:
-            self._atomic_write_bytes(body_path, content)
         return key
 
     def flush(self):

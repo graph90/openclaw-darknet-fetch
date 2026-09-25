@@ -373,3 +373,63 @@ This is the project's core differentiator. Future work:
 - **v2.5 (distribution):** Docker, example config, docs/EXAMPLES, SECURITY.md, CI quality gates.
 
 Order within each version is dependency-driven; every version ships fully working.
+
+---
+
+## 14. Shipped 2026-09-25 — v2.2 darknet depth (verified on live Tor + I2P)
+
+### Search engines
+- **`tor66` backend** (new, the one engine that actually works today): v3 onion
+  `http://3bbad7fauom4d6sgppalyqddsqbf5u5p56b5k5uk2zxsy3d6ey2jobad.onion` plus the
+  `https://tor66.org` clearnet mirror. Parses both front-ends, prefers the plaintext
+  `div.link` target over the `/ads/click?s=` hop, flags `sponsored` blocks, dedupes targets,
+  stops at the pagination sentinel.
+- **`marginalia` backend** (new): independent index, no CAPTCHA on a normal cadence.
+- **`AUTO_BACKENDS`** fallback chain per network — `tor: tor66 → ahmia → ddg`,
+  `normal/i2p: marginalia → ddg`, `auto: tor66 → marginalia → ddg` (onion index first, then
+  the clearnet; the fetcher routes each engine itself because `auto` is TLD-aware).
+- **`_looks_blocked`** detects engine interstitials (DDG's 202 "bots use DuckDuckGo too",
+  Marginalia's "aggressive bot activity" wall, generic CAPTCHA/consent pages) and fails with
+  `error_code=REQUEST` + `blocked_backends` + a hint to point `--search-backend` at your own
+  SearXNG, instead of a misleading "0 results".
+- **Sponsored filtering**: dropped by default (rank renumbered), `include_sponsored=True` /
+  `--include-sponsored` to keep them.
+- `backends_tried` / `blocked_backends` on every search result; `html.unescape` in `_strip_tags`.
+
+Measured live: Ahmia is JS-only (0 server-rendered results), DDG `html.`/`lite.` always
+202-challenge this IP, Marginalia throttles intermittently, so the onion path (tor66) is the
+default for Tor and `auto`.
+
+### Network routing
+- **`network="auto"`** everywhere (fetch/fetch_many/crawl/search/search_fetch/MCP/`--network`):
+  `.onion` → Tor, `.i2p` → I2P, else clearnet, per target. New CLI flag `-a`.
+  Cache keys include the *resolved* network so auto and explicit fetches never collide.
+- **`check_proxy()` with `auto`** probes all three networks and returns a `probes` map
+  (one entry per network, each with `ok`/`proxy`/`exit_ip`/`is_tor`).
+
+### Tor / I2P depth
+- **Per-request circuit isolation** (default on, `isolate=` ctor arg, `--isolate/--no-isolate`,
+  `OPENCLAW_ISOLATE` env): each Tor request gets unique SOCKS credentials
+  (`socks5h://isolate-<uuid>:<uuid>-<tag>@127.0.0.1:9050`), so a multi-URL run does not share
+  an exit node. Retry attempts get distinct tags. Ignored for normal/I2P (no stream isolation
+  primitive there). This is *stream* isolation, not a new identity.
+- **Darknet timeout floors** (45s connect / 90s read) applied to `.onion`/`.i2p` only, and
+  only when the caller did not pass `--timeout`/`--connect-timeout` (explicit values always
+  win). Tor66's cold onion connect measured 11.1s, well past the old 10s connect default.
+
+### Contract / robustness
+- `error_result` now returns the **full canonical read shape** (status/text/content_kind/links/
+  metadata/items/…) so agents can index failed results without attribute errors; per-result
+  mutable defaults are no longer shared.
+- `target_tld` is derived from the URL for failures too (onion/i2p/clearnet).
+
+### Live verification
+`auto` clearnet/I2P/Tor routing 200s; `check_proxy` auto-probes all three; tor66 onion search
+returns real onion targets; a cold onion fetch over Tor completes in ~3.7s with the default
+(isolated) settings. Offline suite: 144 tests green (local HTTP server + fake SOCKS5, no
+network needed).
+
+### Still open
+`--find-mirrors`/`--mirrors`, `--collect-documents`, `--i2p-jump`, circuit rotation via
+ControlPort, `Result.items` collision, raw/binary contract, RSS relative links, library JSON
+validation, robots `allow_errors`, search-result cache poisoning, CI (ruff/mypy), docs/EXAMPLES.

@@ -166,3 +166,35 @@ class TestCliCache:
         out = json.loads(p.stdout)
         assert out["ok"] is False
         assert "error_code" in out
+
+class TestCliDarknet:
+    def test_auto_flag_routes_by_target(self, server):
+        out = run_cli(["-a", server.url("/"), "--json", "--no-cache"])
+        assert out.returncode == 0
+        payload = json.loads(out.stdout)
+        assert payload["network"] == "NORMAL"
+        assert payload["ok"] is True
+
+    def test_mcp_subcommand_accepts_auto_network(self):
+        out = run_cli(["mcp", "--network", "auto"])
+        # without the optional mcp dependency this fails on import, not on parsing
+        assert "unrecognized" not in (out.stderr + out.stdout)
+
+    def test_isolate_flags_pass_through(self, server, socks_proxy):
+        for flag in ("--isolate", "--no-isolate"):
+            out = run_cli(["-t", server.url("/echo?q=1"),
+                           "--tor-proxy", socks_proxy.url(), flag, "--json", "--no-cache"])
+            assert out.returncode == 0, out.stderr
+            assert json.loads(out.stdout)["ok"] is True
+
+    def test_include_sponsored_flag_is_accepted(self):
+        out = run_cli(["--search", "x", "--include-sponsored", "--search-backend", "searxng"])
+        # searxng without a base URL is a usage error, but the flag must parse
+        assert out.returncode == 1
+        assert "searxng" in (out.stderr + out.stdout).lower()
+
+    def test_check_proxy_auto_reports_all_networks(self):
+        out = run_cli(["-a", "--check-proxy", "--json"])
+        assert out.returncode in (0, 5, 6, 7)
+        payload = json.loads(out.stdout)
+        assert set(payload["probes"]) == {"normal", "tor", "i2p"}

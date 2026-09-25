@@ -19,6 +19,12 @@ I2P_PROXY_DEFAULT = "http://127.0.0.1:4444"
 
 DEFAULT_TIMEOUT = 30
 DEFAULT_CONNECT_TIMEOUT = 10
+#: Onion/I2P targets must fetch service descriptors and build a tunnel before
+#: the first byte flows, which regularly exceeds the clearnet connect timeout.
+DARKNET_CONNECT_TIMEOUT = 45
+#: Onion services are frequently slow to answer; a plain read timeout of 30s
+#: produces spurious failures on a fresh circuit.
+DARKNET_TIMEOUT = 90
 DEFAULT_RETRIES = 2
 DEFAULT_RETRY_BACKOFF = 1.0
 DEFAULT_MAX_BYTES = 2 * 1024 * 1024      # hard body cap (decompression-bomb guard)
@@ -28,6 +34,8 @@ DEFAULT_CACHE_TTL = 3600
 DEFAULT_CACHE_DIR = os.path.join("~", ".cache", "openclaw-fetch")
 DEFAULT_CONCURRENCY = 4
 DEFAULT_MAX_REDIRECTS = 30
+#: Route each Tor request over its own circuit (Tor's IsolateSOCKSAuth).
+DEFAULT_ISOLATE = True
 
 _ENV_PREFIX = "OPENCLAW_"
 
@@ -47,6 +55,7 @@ _ENV_BINDINGS = {
     "CACHE_DIR": ("str", DEFAULT_CACHE_DIR),
     "CONCURRENCY": ("int", DEFAULT_CONCURRENCY),
     "MAX_REDIRECTS": ("int", DEFAULT_MAX_REDIRECTS),
+    "ISOLATE": ("bool", DEFAULT_ISOLATE),
 }
 
 
@@ -57,6 +66,8 @@ def _coerce(kind, raw):
         return int(raw)
     if kind == "float":
         return float(raw)
+    if kind == "bool":
+        return str(raw).strip().lower() in ("1", "true", "yes", "on")
     return raw
 
 
