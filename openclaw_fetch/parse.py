@@ -362,7 +362,7 @@ def parse_document(text, *, content_type="", requested_url="", final_url="",
         result["text"] = "[image content: %s bytes (use --save-raw to download)]" % source_len
         return result
     if kind == "rss":
-        feed = parse_feed(text)
+        feed = parse_feed(text, base_url=final_url or requested_url)
         result["title"] = feed.get("title", "")
         result["items"] = feed.get("items", [])
         result["text"] = feed.get("text", "")
@@ -459,11 +459,13 @@ def _pdf_via_pdftotext(raw_body):
     return None
 
 
-def parse_feed(text):
+def parse_feed(text, base_url=""):
     """Parse RSS 2.0 / Atom / RDF XML into a feed dict.
 
     Returns ``{title, items: [{title, link, guid, date, summary, tags}],
-    text, metadata}``. Never raises on malformed XML.
+    text, metadata}``. Never raises on malformed XML. ``base_url`` resolves
+    relative item links (feeds are full of ``/path`` links) and relative
+    ``xml:base``/``atom:link`` hrefs.
     """
     import xml.etree.ElementTree as ET
 
@@ -509,6 +511,8 @@ def parse_feed(text):
                 if full_link:
                     break
         link = full_link or link
+        if link and base_url:
+            link = urljoin(base_url, link)
         title = child_text(node, "title")
         guid = child_text(node, "guid") or link
         if not (link or guid):

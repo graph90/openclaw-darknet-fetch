@@ -466,7 +466,11 @@ there — with one tool call each, and never silently degrade its own anonymity 
    topic from the darknet and give me a sourced brief". Design top-down from agent tasks.
 6. **Token economics are a first-class output.** Every multi-fetch operation reports
    estimated tokens, per-source token cost, and supports a budget.
-7. **Darknet reality is hostile to nice clients:** sites vanish, handshakes stall, engines
+7. **Never execute page JavaScript.** Darknet users reject JS because it widens their
+   fingerprinting surface; running a browser against an onion service makes the tool an
+   attack surface instead of a reader. Server-rendered HTML plus embedded-JSON extraction is
+   the darknet-native path; any renderer is opt-in, never default, never implicit.
+8. **Darknet reality is hostile to nice clients:** sites vanish, handshakes stall, engines
    challenge, mirrors rot. The tool's job is to absorb that pathology and report it as data
    (`suspected_dead`, `blocked_by`, `rtt_ms`) rather than as exceptions.
 
@@ -492,7 +496,7 @@ Known contract bugs found while planning (all P0, all cheap):
 | 9 | `search()` on `auto` chains can return `ok=True` with 0 results when one engine was empty and another failed | `search.py:364-443` | silent empty results |
 | 10 | Two tests hit live endpoints while README claims the suite is fully offline | `tests/test_fetch.py:270`, `tests/test_cli.py:196` | flaky CI story |
 
-## 17. Phase 0 — contract honesty (do first, ~1 day)
+## 17. Phase 0 — contract honesty (do first, ~1 day) — **SHIPPED 2026-09-25**
 
 Nothing else matters if the documented contract is a lie. Fix #1-#10, then **stop
 appending "shipped" sections and keep `plan.md` as a live status board** (a `status:`
@@ -512,6 +516,19 @@ column per item, updated in the same commit as the code).
 - `#9` auto search distinguishes "no results" from "all backends failed": if every backend
   failed, `ok=False`; if at least one succeeded with 0 hits, `ok=True, total_results=0`.
 - `#10` mark live tests `@pytest.mark.live`, add `pytest -m "not live"` to CI.
+
+Delivered: `#1` search default is `auto`; `#2` `check_proxy_for("auto")` delegates;
+`#3` `format=` on `fetch`/`fetch_many`; `#4` crawl reports `pages_succeeded`/`pages_failed`
+and fails when nothing readable came back; `#5` `Result.feed_items` alias + docs;
+`#6` `RawBody` keeps exact bytes *and* `json.dumps` working, `--raw` writes bytes,
+`--save-raw PATH` implemented; `#7` `parse_feed(base_url=...)` resolves relative item links;
+`#8` `--expect` mismatch stays a failure with `--allow-errors`; `#9` search reports
+`backends_failed` and only fails when *no* engine answered; `#10` live markers registered
+(`pytest` now defaults to `-m "not live"`). Also fixed along the way: human search output no
+longer hides failures behind `RESULTS: 0`; MCP `crawl` passed a bogus `fetcher_kwargs=` into
+`Fetcher()` (crashed on every call); MCP `search_fetch` leaked `max_chars=0` into fetched
+pages (fixed with `Fetcher.clone()`); MCP search tools now expose `search_url`,
+`time_range`, `include_sponsored`, `isolate`. 171 offline tests, 2 live.
 
 ## 18. Phase 1 — Tor you can see and control
 
@@ -624,19 +641,54 @@ I2P is the least mature path and the most neglected; the plan should say so hone
    `{ts, network, url, status, took_ms, cached, event}`) so an agent's whole run is
    auditable and replayable. This is the "no telemetry" story made verifiable.
 
-## 22. Phase 5 — read what darknet actually serves
+## 22. Phase 5 — read what darknet actually serves (measured, not guessed)
 
-1. **Optional headless renderer through the same proxy** (`[render]` extra: playwright).
-   Most onion front-ends and a large share of eepsites are JS-only — a large fraction of the
-   darknet is currently *unreadable* by this tool. Per-browser-context proxy config gives us
-   per-context circuits, i.e. isolation for free. `needs_renderer` already flags these pages;
-   wire it to an opt-in `--render`.
-2. **Cheap extraction modes for token budgets**: `--metadata-only` (title + headings +
-   classified links), `--selector CSS` (precise region), `--extract json|csv` (tables/forms).
-3. **Content dedupe/clustering across networks** (SimHash/MinHash on extracted text) so
-   mirrors/aggregators do not eat the budget; report clusters instead of duplicates.
-4. **Cheap offline language detection** on extracted text so agents can filter non-English
-   mirrors before spending tokens.
+**Measured 2026-09-25** (60 onion URLs from tor66 across 7 queries, fetched over real Tor;
+`/tmp/opencode/onion_sample.json`):
+
+| Signal | Result |
+|---|---|
+| Returned 200 | 56 / 60 (93%) |
+| Usable extracted text (>=500 chars) | 41 / 60 (68%) |
+| Thin text (<500 chars) | 15 — mostly *genuinely* thin (empty search pages, "please wait", member-gated) |
+| Tripped `needs_renderer` | 6 (10%) |
+| Pages telling the reader to enable JS | 1 |
+
+**Conclusion: the darknet is server-rendered on purpose.** Users reject JS because it
+widens the fingerprinting/attack surface, so the original "add a headless browser" milestone
+was wrong — it would be near-useless *and* philosophically backwards for this audience.
+The headless renderer is demoted to an opt-in, clearnet-only escape hatch (see 22.5).
+The real work is closing the gaps the sample actually exposed:
+
+1. **Embedded-payload extraction is the JS answer for the darknet.** 3 of the 6
+   `needs_renderer` pages were returning raw `__NEXT_DATA__` / Apollo state as *text*
+   (one leaked 12.5k chars of JSON instead of an article). Extract, walk and flatten those
+   payloads server-side: no JS engine, no fingerprint, real content. Target: the
+   `needs_renderer` share of *usable text* should approach zero.
+2. **Interstitial/"please wait" handling.** Several darknet front-ends answer with a
+   language-rotating "Proszę czekać... / Bitte warten... / Please wait..." shell and then
+   serve the real page. Detect it, wait briefly, refetch once, and label the result
+   `metadata.interstitial=true` instead of returning 40 characters of nothing.
+3. **Honest labels for pages an agent should skip**: `gated` (members-only/login),
+   `empty_index` (directory with no entries), `search_no_hits`, `challenge`. These are not
+   errors, but an agent spending tokens on them is wasting budget — the label tells it to
+   move on.
+4. **Directory/index extraction.** Onion front-ends (oniondir, hidden wiki, dark.fail
+   lists) are link farms; extract structured `{title, url, snippet, category}` rows rather
+   than prose, and detect "index page" content kind.
+5. **Cheap extraction modes for token budgets**: `--metadata-only` (title + headings +
+   classified links), `--selector CSS`, `--extract json|csv`.
+6. **Content dedupe/clustering across networks** (SimHash/MinHash) so mirrors and
+   aggregators do not eat the budget.
+7. **Cheap offline language detection** — darknet is heavily non-English, and the
+   interstitials above prove it matters for triage.
+8. **`--render` (demoted, opt-in, clearnet-first).** Only for JS apps where the user asks;
+   per-browser-context proxy = per-context circuit. Document plainly that running a
+   browser *adds* fingerprinting surface and therefore must never be the default, and never
+   silently enabled for `.onion`/`.i2p`.
+9. **No-JS contract in the docs**: the tool never executes page JS, never loads third-party
+   subresources, and strips `<script>` before extraction. Make that a stated guarantee
+   (a `docs/SECURITY.md` item) because for this audience it is the point.
 
 ## 23. Phase 6 — ops, quality, distribution
 
@@ -663,16 +715,17 @@ I2P is the least mature path and the most neglected; the plan should say so hone
 | M5 | `find_mirrors` + `compare` (availability + diff) | M2 | 4d | highest agent utility per line of code |
 | M6 | `deep_fetch` composite + budgets + `dry_run` | M5 | 5d | the flagship one-call agent workflow |
 | M7 | `Onion-Location` harvesting, dead-onion ledger, link classification | M2 | 3d | discovery + crawl efficiency |
-| M8 | `--render` (playwright over proxy) + extraction modes | M0 | 5d | unlocks JS-only darknet content |
+| M8 | Darknet-native extraction: embedded payload walking (22.1), interstitial retry + skip labels (22.2-3), directory extraction (22.4) | M2 | 4d | measured 68% usable text; the real gap, not JS |
 | M9 | `watch` + resumable crawl checkpoints | M2 | 3d | flaky-site reality |
 | M10 | MCP expansion + structured log + enums | M5 | 3d | agent runtime completeness |
 | M11 | CI/ruff/mypy/fake-I2P fixture/extras/Docker/config.toml/docs | M0 | 5d | makes the rest sustainable |
 
 ## 25. Success metrics (how we know the goal was met)
 
-- **Usable-text rate on real darknet pages:** ≥ 80% of sampled onion/eepsite URLs return
-  non-trivial extracted text (today: unknown, likely low — measure it in M0 with a 100-URL
-  sampler and print the number; the `--render` milestone is judged by moving it).
+- **Usable-text rate on real darknet pages:** baseline measured at 68% of onion URLs
+  (41/60 with >=500 chars, 93% reachable) — target >= 85% *without* a JS engine, by fixing
+  embedded-payload extraction (22.1) and interstitial retries (22.2). Re-measure with the
+  same sampler script each milestone; the number, not the feature, is the goal.
 - **Provenance completeness:** 100% of agent-visible results carry network, isolation mode,
   exit-verification state, content hash, and timestamp.
 - **Anonymity honesty:** 0 cases where a darknet request silently used a weaker network; 0

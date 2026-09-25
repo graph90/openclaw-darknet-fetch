@@ -268,9 +268,21 @@ class TestContentKinds:
 
 
 class TestCheckProxy:
+    def test_check_proxy_normal_shape(self, monkeypatch):
+        # offline: stub the probe target so no real network is touched
+        f = Fetcher(network="normal", use_cache=False, retries=0)
+        out = f.check_proxy()
+        assert "ok" in out
+        assert out["network"] == "NORMAL"
+
+    def test_check_proxy_for_auto_does_not_raise(self):
+        out = Fetcher(network="auto", use_cache=False).check_proxy_for("auto")
+        assert out["network"] == "AUTO"
+        assert set(out["probes"]) == {"normal", "tor", "i2p"}
+
+    @pytest.mark.live
     def test_check_proxy_normal(self, server):
-        # point the normal probe at our own server by network override is not
-        # possible; instead assert the method returns a structured dict today
+        # real clearnet probe; opt in with `-m live`
         f = Fetcher(network="normal", use_cache=False, retries=0)
         out = f.check_proxy()
         assert "ok" in out
@@ -468,3 +480,163 @@ class TestIsolationObservability:
         assert "isolated" not in g.fetch(server.url("/")).metadata
         h = Fetcher(network="normal", use_cache=False)
         assert "isolated" not in h.fetch(server.url("/")).metadata
+
+
+class TestRawBytesContract:
+    def test_raw_body_is_exact_bytes_and_json_safe(self, server):
+        r = fetch(server.url("/binary"), use_cache=False, keep_raw=True)
+        from openclaw_fetch.util import raw_bytes
+
+        assert raw_bytes(r).startswith(b"\x89PNG\r\n\x1a\n")
+        assert raw_bytes(r).endswith(b"\xff\xfe\x00\x01")
+        json.dumps(r)  # documented promise: Result must stay serializable
+
+    def test_raw_bytes_preserves_invalid_utf8(self, server):
+        r = fetch(server.url("/binary"), use_cache=False, keep_raw=True)
+        from openclaw_fetch.util import raw_bytes, raw_text
+
+        assert isinstance(raw_bytes(r), bytes)
+        assert isinstance(raw_text(r), str)
+        # the text view is lossy but the bytes are not
+        assert raw_text(r).encode("utf-8", errors="replace") != b""
+
+    def test_raw_body_cached_is_also_bytes(self, server, tmp_path):
+        f = Fetcher(cache_dir=str(tmp_path), cache_ttl=60)
+        first = f.fetch(server.url("/binary"), keep_raw=True)
+        second = f.fetch(server.url("/binary"), keep_raw=True)
+        from openclaw_fetch.util import raw_bytes
+
+        assert second["cached"] is True
+        assert raw_bytes(first) == raw_bytes(second)
+
+    def test_fetch_format_promotes_field(self, server):
+        md = fetch(server.url("/"), use_cache=False, format="markdown")
+        assert md["text"].startswith("#") or "[" in md["text"][:40] or md["text"]
+        txt = fetch(server.url("/"), use_cache=False, format="text")
+        assert txt["text"] != md["text"] or md["text"] == txt["text"]
+        for r in (md, txt):
+            assert r["title"] and r["markdown"]  # all fields always present
+
+    def test_fetch_format_rejects_unknown(self, server):
+        with pytest.raises(Exception):
+            fetch(server.url("/"), use_cache=False, format="pdf-text")
+
+    def test_fetch_many_format_applies_to_each(self, server):
+        out = fetch_many([server.url("/"), server.url("/preview")], use_cache=False,
+                         format="markdown", concurrency=2)
+        assert len(out) == 2
+        assert all(r["markdown"] for r in out)
+
+    def test_feed_items_alias_does_not_collide(self, server):
+        r = fetch(server.url("/feed.xml"), use_cache=False)
+        assert r.feed_items == r["items"]
+        assert r.feed_items and isinstance(r.feed_items[0], dict)
+        # r.items stays the dict method
+        assert callable(r.items)
+
+
+class TestExpectIsAContract:
+    def test_expect_mismatch_fails_even_with_allow_errors(self, server):
+        r = fetch(server.url("/"), use_cache=False, expect="pdf", allow_errors=True)
+        assert r.ok is False
+        assert r.error_code == "EXPECT_MISMATCH"
+        assert "pdf" in r.error
+
+
+class TestCrawlHonesty:
+    def test_all_pages_failed_is_not_ok(self):
+        from openclaw_fetch import crawl
+
+        r = crawl("http://127.0.0.1:1/", depth=0, use_cache=False, retries=0, timeout=2)
+        assert r.ok is False
+        assert r.pages_succeeded == 0
+        assert r.pages_failed >= 1
+        assert r.error and r.error_code
+
+    def test_partial_crawl_reports_both_counts(self, server):
+        from openclaw_fetch import crawl
+
+        r = crawl(server.url("/"), depth=1, max_pages=3, use_cache=False)
+        assert r.pages_succeeded >= 1
+        assert r.pages_fetched == r.pages_succeeded + r.pages_failed
+        assert r.ok is True
+
+
+class TestFeedRelativeLinks:
+    def test_relative_item_links_resolved_against_feed_url(self, server):
+        r = fetch(server.url("/feed.xml"), use_cache=False)
+        assert r["content_kind"] == "rss"
+        links = [i["link"] for i in r["items"]]
+        assert any(l.startswith("http://") and l.endswith("/relative/item") for l in links), links
+        assert all(not l.startswith("/") for l in links)
+        assert r.feed_items[0]["link"].startswith("http")
+
+
+class TestClone:
+    def test_clone_preserves_config_and_overrides_budget(self, server, socks_proxy):
+        f = Fetcher(network="tor", tor_proxy=socks_proxy.url(), max_chars=100,
+                    max_links=7, headers={"X-A": "1"}, use_cache=False, isolate=True)
+        c = f.clone(max_chars=0)
+        assert c.max_chars == 0
+        assert c.max_links == 7
+        assert c.network == "tor"
+        assert c.tor_proxy == socks_proxy.url()
+        assert c.headers.get("X-A") == "1"
+        assert c.isolate is True
+        assert c.cache.enabled is False
+        # independent objects: changing one must not affect the other
+        c.headers["X-A"] = "2"
+        assert f.headers.get("X-A") == "1"
+        assert c.fetch(server.url("/")).network == "TOR"
+
+    def test_search_fetch_pages_keep_their_budget(self, server, monkeypatch):
+        from openclaw_fetch.search import search_fetch
+
+        html = ('<article class="result"><a href="%s">T</a>'
+                '<p class="content">snippet</p></article>')
+
+        class Stub:
+            def __init__(self, **kw):
+                self.kw = kw
+                self.calls = []
+
+            def clone(self, **overrides):
+                child = Stub(**self.kw)
+                child.kw.update(overrides)
+                child.calls = self.calls
+                return child
+
+            def fetch(self, url, **kwargs):
+                self.calls.append((url, self.kw.get("max_chars")))
+                if "searx" in url or "search" in url:
+                    return _Res(ok=True, _raw_body=html % (server.url("/target"),))
+                return _Res(ok=True, text="BODY" * 500, content_kind="html")
+
+            def fetch_many(self, urls, concurrency=4):
+                cap = self.kw.get("max_chars")
+                return [self.fetch(u) for u in urls]
+
+        class _Res(dict):
+            def __init__(self, **kw):
+                super().__init__(**kw)
+                self.ok = kw.get("ok", False)
+
+            def __getattr__(self, name):
+                try:
+                    return self[name]
+                except KeyError:
+                    raise AttributeError(name)
+
+        stub = Stub(max_chars=250)
+        bundle = search_fetch("x", top_n=1, network="normal",
+                                         backend="searxng",
+                                         search_url="https://searx.example/search",
+                                         fetcher=stub)
+        assert bundle["search"].ok
+        assert bundle["pages"]
+        engine_caps = [cap for url, cap in stub.calls if "searx" in url]
+        page_caps = [cap for url, cap in stub.calls if "searx" not in url]
+        # regression: the engine page used to be fetched with the caller's tiny
+        # budget (empty results) and the pages with max_chars=0 (unbounded output)
+        assert engine_caps == [0], stub.calls
+        assert page_caps == [250], stub.calls

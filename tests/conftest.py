@@ -108,6 +108,20 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/nocharset":
             body = "\u00e9\u00e8\u00ea d\u00e9j\u00e0 vu".encode("iso-8859-1")
             self._send(200, "text/html", body)
+        elif path == "/binary":
+            # PNG magic + bytes that are not valid utf-8: --raw must not corrupt it
+            body = b"\x89PNG\r\n\x1a\n" + bytes(range(0, 32)) + b"\xff\xfe\x00\x01"
+            self._send(200, "image/png", body)
+        elif path == "/feed.xml":
+            body = (
+                '<?xml version="1.0"?><rss version="2.0"><channel><title>Fixture Feed</title>'
+                "<item><title>Absolute item</title><link>https://example.org/a</link>"
+                "<description>d1</description></item>"
+                "<item><title>Relative item</title><link>/relative/item</link>"
+                "<description>d2</description></item>"
+                "</channel></rss>"
+            ).encode("utf-8")
+            self._send(200, "application/rss+xml; charset=utf-8", body)
         elif path == "/pdf":
             self._send(200, "application/pdf", b"%PDF-1.4 fake")
         elif path == "/robots.txt":

@@ -24,6 +24,7 @@ from html import unescape
 from urllib.parse import parse_qs, urlencode, urljoin, urlparse
 
 from .result import Result
+from .util import raw_text
 
 SEARCH_BACKENDS = ("auto", "ddg", "ahmia", "tor66", "marginalia", "searxng")
 
@@ -148,7 +149,7 @@ def _looks_blocked(raw):
 
 
 def _results(backend, network, query, items, took_ms, error=None, error_code=None,
-             backends_tried=None, blocked_backends=None):
+             backends_tried=None, blocked_backends=None, backends_failed=None):
     result = Result(
         ok=error is None,
         error=error or "",
@@ -157,6 +158,7 @@ def _results(backend, network, query, items, took_ms, error=None, error_code=Non
         backend=backend,
         backends_tried=list(OrderedDict.fromkeys(backends_tried or [])),
         blocked_backends=list(blocked_backends or []),
+        backends_failed=list(OrderedDict.fromkeys(backends_failed or [])),
         query=query,
         total_results=len(items),
         results=items,
@@ -400,6 +402,7 @@ def search(query, *, network="normal", backend="auto", max_results=8,
     last_error = ""
     last_code = "REQUEST"
     empty_responses = 0
+    failed = []
     for name in candidates:
         parser = _PARSERS.get(name)
         if parser is None:
@@ -411,8 +414,9 @@ def search(query, *, network="normal", backend="auto", max_results=8,
             if not resp.ok:
                 last_error = resp.error or "search failed"
                 last_code = resp.error_code or "REQUEST"
+                failed.append(name)
                 continue
-            raw = resp.get("_raw_body") or resp.get("text") or ""
+            raw = raw_text(resp)
             items = parser(raw, url)
             if not include_sponsored:
                 items = [item for item in items if not item.get("sponsored")]
@@ -428,6 +432,8 @@ def search(query, *, network="normal", backend="auto", max_results=8,
                 empty_responses += 1
     took = int((time.monotonic() - t0) * 1000)
     primary = candidates[0] if candidates else "auto"
+    # ok=False only when no engine answered at all; "answered, zero hits" is a
+    # successful empty result and must not be reported as a failure.
     if blocked and not empty_responses:
         return _results(
             primary, network, query, [], took,
@@ -440,7 +446,8 @@ def search(query, *, network="normal", backend="auto", max_results=8,
                         blocked_backends=blocked)
     return _results(primary, network, query, [], took,
                     error=last_error or "search failed",
-                    error_code=last_code, backends_tried=tried)
+                    error_code=last_code, backends_tried=tried,
+                    backends_failed=failed)
 
 
 
@@ -459,8 +466,10 @@ def search_fetch(query, *, top_n=3, network="normal", backend="auto",
     from .fetcher import Fetcher
 
     if fetcher is None:
-        fetcher_kwargs.setdefault("max_chars", 0)
         fetcher = Fetcher(network=network, **fetcher_kwargs)
+    # The engine's result page must never be truncated (it is parsed, not read),
+    # but the articles we fetch afterwards must respect the caller's budget.
+    search_fetcher = fetcher.clone(max_chars=0)
     search_kwargs = dict(search_kwargs or {})
     search_kwargs.setdefault("search_url", search_url)
     search_kwargs.setdefault("time_range", time_range)
@@ -471,7 +480,7 @@ def search_fetch(query, *, top_n=3, network="normal", backend="auto",
         network=network,
         backend=backend,
         max_results=max(top_n, 1),
-        fetcher=fetcher,
+        fetcher=search_fetcher,
         **search_kwargs,
     )
     pages = []

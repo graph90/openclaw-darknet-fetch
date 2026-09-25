@@ -11,11 +11,12 @@ import pytest
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
-def run_cli(args, cwd=REPO):
+def run_cli(args, cwd=REPO, text=True):
+    """Run the CLI. ``text=False`` captures bytes, which ``--raw`` really needs."""
     return subprocess.run(
         [sys.executable, "-m", "openclaw_fetch", *args],
         capture_output=True,
-        text=True,
+        text=text,
         cwd=cwd,
         timeout=60,
     )
@@ -193,8 +194,54 @@ class TestCliDarknet:
         assert out.returncode == 1
         assert "searxng" in (out.stderr + out.stdout).lower()
 
+    @pytest.mark.live
     def test_check_proxy_auto_reports_all_networks(self):
         out = run_cli(["-a", "--check-proxy", "--json"])
-        assert out.returncode in (0, 5, 6, 7)
         payload = json.loads(out.stdout)
         assert set(payload["probes"]) == {"normal", "tor", "i2p"}
+
+
+class TestCliContractFixes:
+    def test_search_without_backend_uses_auto(self):
+        out = run_cli(["--search", "x", "-n", "--json"])
+        payload = json.loads(out.stdout)
+        # the regression: backend=None used to fail as USAGE before searching
+        assert payload["error_code"] != "USAGE"
+        assert payload["backend"] in ("marginalia", "ddg", "tor66", "ahmia", "searxng")
+        assert payload["backends_tried"]
+
+    def test_search_human_output_shows_failure(self):
+        out = run_cli(["--search", "x", "-n", "--search-backend", "nope"])
+        combined = out.stdout + out.stderr
+        assert "SEARCH FAILED" in combined
+        assert "only http/https" in combined
+        assert "FAILED BACKENDS" in combined
+        assert out.returncode == 1
+
+    def test_raw_flag_emits_original_bytes(self, server):
+        out = run_cli(["-n", server.url("/binary"), "--raw", "--no-cache"], text=False)
+        assert out.returncode == 0
+        assert out.stdout.startswith(b"\x89PNG\r\n\x1a\n")
+        assert out.stdout.endswith(b"\xff\xfe\x00\x01")
+
+    def test_save_raw_writes_file(self, server, tmp_path):
+        target = tmp_path / "body.bin"
+        out = run_cli(["-n", server.url("/binary"), "--save-raw", str(target),
+                       "--no-cache", "--json"])
+        assert out.returncode == 0
+        assert target.exists()
+        assert target.read_bytes().startswith(b"\x89PNG")
+
+    def test_save_raw_directory_writes_per_result(self, server, tmp_path):
+        target = tmp_path / "raws"
+        out = run_cli(["-n", server.url("/"), server.url("/binary"),
+                       "--save-raw", str(target), "--no-cache", "--json"])
+        assert out.returncode == 0
+        assert len(list(target.iterdir())) == 2
+
+    def test_expect_mismatch_exits_nonzero_with_allow_errors(self, server):
+        out = run_cli(["-n", server.url("/"), "--expect", "pdf", "--allow-errors", "--json"])
+        payload = json.loads(out.stdout)
+        assert payload["ok"] is False
+        assert payload["error_code"] == "EXPECT_MISMATCH"
+        assert out.returncode == 5

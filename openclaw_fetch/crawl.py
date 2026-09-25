@@ -114,16 +114,21 @@ def crawl(seed_url, depth=1, max_pages=10, *, network="normal", fetcher=None,
                 frontier.append((next_url, d + 1))
 
     page_list = list(pages.values())
-    failed_root = len(page_list) == 0
-    # A crawl with zero successful pages but a root that was fetched & classified
-    # non-ok is still a failed crawl.
-    ok = not failed_root
+    succeeded = [p for p in page_list if p.get("ok")]
+    failed = [p for p in page_list if not p.get("ok")]
+    # A crawl only "worked" if at least one page came back readable; attempted
+    # pages that all failed must not read as success.
+    ok = bool(succeeded)
     error = ""
     error_code = None
-    if failed_root:
-        ok = False
+    if not page_list:
         error = "no pages fetched"
-        error_code = "REQUEST"
+    elif not succeeded:
+        error = "no page could be fetched (%d attempted, %d failed)" % (
+            len(page_list), len(failed))
+    if error:
+        ok = False
+        error_code = failed[0].get("error_code") if failed else "REQUEST"
     result = Result(
         ok=ok,
         error=error,
@@ -132,6 +137,8 @@ def crawl(seed_url, depth=1, max_pages=10, *, network="normal", fetcher=None,
         requested_url=seed,
         seed_url=seed,
         pages_fetched=len(page_list),
+        pages_succeeded=len(succeeded),
+        pages_failed=len(failed),
         links_discovered=links_discovered,
         max_depth=max_depth_reached,
         max_depth_target=depth,

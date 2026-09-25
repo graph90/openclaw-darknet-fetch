@@ -106,3 +106,57 @@ def normalize_url(url):
     ):
         netloc = netloc.rsplit(":", 1)[0]
     return urlunsplit((scheme, netloc, parts.path, parts.query, ""))
+
+class RawBody(str):
+    """A raw response body that serializes as text but keeps the exact bytes.
+
+    ``Result`` promises ``json.dumps(result)`` works, so the private ``_raw_body``
+    value must be a ``str`` -- but ``--raw`` and ``--save-raw`` must hand back the
+    original bytes, not a lossy decode. This is both: use :func:`raw_bytes` to get
+    the original.
+    """
+
+    __slots__ = ("_raw",)
+
+    def __new__(cls, data, encoding="utf-8"):
+        if isinstance(data, str):
+            obj = super().__new__(cls, data)
+            obj._raw = data.encode("utf-8", errors="replace")
+        else:
+            obj = super().__new__(cls, bytes(data).decode(encoding, errors="replace"))
+            obj._raw = bytes(data)
+        return obj
+
+    @property
+    def raw(self):
+        """The original, undecoded bytes."""
+        return self._raw
+
+    def __len__(self):
+        return len(self._raw)
+
+
+def raw_text(result, default=""):
+    """Return a result's raw body as text (bytes are decoded, never dropped)."""
+    body = result.get("_raw_body") if hasattr(result, "get") else None
+    if body is None:
+        body = (result or {}).get("text") if hasattr(result, "get") else None
+    if body is None:
+        return default
+    if isinstance(body, bytes):
+        return body.decode("utf-8", errors="replace")
+    return body
+
+
+def raw_bytes(result, default=b""):
+    """Return a result's original raw bytes (text bodies are encoded)."""
+    body = result.get("_raw_body") if hasattr(result, "get") else None
+    if body is None:
+        body = (result or {}).get("text") if hasattr(result, "get") else None
+    if body is None:
+        return default
+    if isinstance(body, RawBody):
+        return body.raw
+    if isinstance(body, bytes):
+        return body
+    return str(body).encode("utf-8", errors="replace")

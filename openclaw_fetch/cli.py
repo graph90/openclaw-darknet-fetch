@@ -5,6 +5,7 @@ Backward compatible with the legacy single-file CLI: ``-n``/``-t``/``-i``,
 """
 
 import argparse
+import re
 import sys
 
 from .version import __version__
@@ -122,8 +123,8 @@ def build_parser():
                         help="Check robots.txt before fetching (clearnet; default off).")
     parser.add_argument("--env-report", action="store_true",
                         help="Print resolved configuration as JSON and exit.")
-    parser.add_argument("--save-raw", action="store_true",
-                        help="Legacy no-op alias kept for compat (raw body is returned under --raw).")
+    parser.add_argument("--save-raw", metavar="PATH",
+                        help="Also write each raw body to PATH (dir, or file for a single URL).")
     return parser
 
 
@@ -299,7 +300,7 @@ def main(argv=None):
         for url in urls:
             sys.stderr.write("[fetch] network=%s url=%s\n" % (network, redact_url(url)))
 
-    keep_raw = fmt == "raw"
+    keep_raw = fmt == "raw" or bool(args.save_raw)
 
     if mode == "search":
         return _run_search(args, fetcher, network, fmt, json_mode)
@@ -316,6 +317,8 @@ def main(argv=None):
                                      keep_raw=keep_raw)
 
     render(results, fmt=fmt)
+    if args.save_raw:
+        _save_raw(results, args.save_raw, json_mode)
 
     worst = 0
     for r in results:
@@ -325,10 +328,63 @@ def main(argv=None):
     return worst
 
 
+def _save_raw(results, target, json_mode):
+    """Write raw bodies to a file (single URL) or one file per result in a dir."""
+    import os
+
+    from .util import raw_bytes
+
+    try:
+        if len(results) == 1 and not target.endswith((os.sep, "/")):
+            paths = [target]
+        else:
+            os.makedirs(target, exist_ok=True)
+            paths = [os.path.join(target, "%02d-%s" % (i + 1, _raw_name(r)))
+                     for i, r in enumerate(results)]
+        for path, result in zip(paths, results):
+            with open(path, "wb") as fh:
+                fh.write(raw_bytes(result))
+    except OSError as exc:
+        sys.stderr.write("ERROR: cannot save raw body: %s\n" % exc)
+    else:
+        if not json_mode:
+            for path in paths:
+                sys.stderr.write("[raw] %s\n" % path)
+
+
+def _raw_name(result):
+    from .util import host_of
+
+    host = host_of(result.get("final_url") or result.get("requested_url") or "body")
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", host) or "body"
+
+
+def _print_search_human(payload, sres):
+    """Human search output that never hides a failure behind RESULTS: 0."""
+    print("SEARCH: %s" % sres.get("query", ""))
+    print("BACKEND: %s  NETWORK: %s  RESULTS: %s" % (
+        sres.get("backend", ""), sres.get("network", ""), sres.get("total_results", 0)))
+    for item in sres.get("results", []):
+        print("- [%s] %s" % (item.get("target_tld", ""), item.get("title", "")))
+        print("  %s" % item.get("url", ""))
+        if item.get("snippet"):
+            print("  %s" % (item["snippet"][:200]))
+    tried = sres.get("backends_tried") or []
+    if len(tried) > 1:
+        print("TRIED: %s" % ", ".join(tried))
+    if sres.get("blocked_backends"):
+        print("BLOCKED BY: %s" % ", ".join(sres["blocked_backends"]))
+    if sres.get("backends_failed"):
+        print("FAILED BACKENDS: %s" % ", ".join(sres["backends_failed"]))
+    if not sres.get("ok", True):
+        sys.stderr.write("SEARCH FAILED [%s]: %s\n" % (
+            sres.get("error_code") or "APP_ERROR", sres.get("error") or "unknown error"))
+
+
 def _run_search(args, fetcher, network, fmt, json_mode):
     from .search import SEARCH_BACKENDS, search, search_fetch
 
-    backend = args.search_backend
+    backend = args.search_backend or "auto"
     search_url = None
     if backend and backend not in SEARCH_BACKENDS:
         search_url = backend  # treat an unknown value as a SearXNG base URL
@@ -386,28 +442,14 @@ def _emit_json(payload, fmt, json_mode, search_only=False):
     # human renderer
     if isinstance(payload, dict) and "search" in payload:
         sres = payload["search"]
-        print("SEARCH: %s" % sres.get("query", ""))
-        print("BACKEND: %s  NETWORK: %s  RESULTS: %s" % (
-            sres.get("backend", ""), sres.get("network", ""), sres.get("total_results", 0)))
-        for item in sres.get("results", []):
-            print("- [%s] %s" % (item.get("target_tld", ""), item.get("title", "")))
-            print("  %s" % item.get("url", ""))
-            if item.get("snippet"):
-                print("  %s" % (item["snippet"][:200]))
+        _print_search_human(payload, sres)
         print("\nFETCHED TOP-N PAGES:")
         for page in payload.get("pages", []):
             print("- %s [%s] ok=%s status=%s source=%s" % (
                 page.get("requested_url", ""), page.get("content_kind", ""),
                 page.get("ok"), page.get("status"), page.get("source", "")))
     elif isinstance(payload, dict) and "results" in payload and payload.get("query") is not None:
-        print("SEARCH: %s" % payload.get("query", ""))
-        print("BACKEND: %s  NETWORK: %s  RESULTS: %s" % (
-            payload.get("backend", ""), payload.get("network", ""), payload.get("total_results", 0)))
-        for item in payload.get("results", []):
-            print("- [%s] %s" % (item.get("target_tld", ""), item.get("title", "")))
-            print("  %s" % item.get("url", ""))
-            if item.get("snippet"):
-                print("  %s" % (item["snippet"][:200]))
+        _print_search_human(payload, payload)
     elif isinstance(payload, dict) and "pages" in payload:
         print("CRAWL SEED: %s" % payload.get("seed_url", ""))
         print("PAGES: %s  LINKS: %s  MAX_DEPTH: %s/%s  EXHAUSTED: %s  MAX_PAGES_HIT: %s" % (

@@ -369,3 +369,81 @@ class TestMcpDefaults:
 
         out = server.tools["proxy_status"](network="auto")
         assert out["network"] == "AUTO"
+
+
+class TestMcpToolSurface:
+    @staticmethod
+    def _server(monkeypatch, calls):
+        import sys
+        import types
+
+        from openclaw_fetch.mcp_server import _build_server
+
+        class FakeFetcher:
+            def __init__(self, **kwargs):
+                calls.append(kwargs)
+
+            def clone(self, **overrides):
+                calls.append({"clone": overrides})
+                return self
+
+            def fetch(self, url, **kwargs):
+                from openclaw_fetch.result import Result
+
+                return Result(ok=True, text="page text", markdown="# page", final_url=url)
+
+            def fetch_many(self, urls, concurrency=4):
+                return [self.fetch(url) for url in urls]
+
+            def check_proxy(self):
+                return {"ok": True, "network": "AUTO", "probes": {}}
+
+        class FakeMCP:
+            def __init__(self, name):
+                self.tools = {}
+
+            def tool(self):
+                def decorate(fn):
+                    self.tools[fn.__name__] = fn
+                    return fn
+
+                return decorate
+
+        fastmcp = types.ModuleType("mcp.server.fastmcp")
+        fastmcp.FastMCP = FakeMCP
+        server_module = types.ModuleType("mcp.server")
+        server_module.fastmcp = fastmcp
+        mcp_module = types.ModuleType("mcp")
+        mcp_module.server = server_module
+        monkeypatch.setitem(sys.modules, "mcp", mcp_module)
+        monkeypatch.setitem(sys.modules, "mcp.server", server_module)
+        monkeypatch.setitem(sys.modules, "mcp.server.fastmcp", fastmcp)
+        monkeypatch.setattr("openclaw_fetch.fetcher.Fetcher", FakeFetcher)
+        return _build_server(network="normal")
+
+    def test_every_network_tool_does_not_explode(self, monkeypatch, server):
+        calls = []
+        tools = self._server(monkeypatch, calls)
+        # crawl used to pass fetcher_kwargs= into Fetcher() -> TypeError
+        out = tools.tools["crawl"](server.url("/"), depth=0)
+        assert "pages" in out
+        tools.tools["search"]("x", backend="marginalia")
+        tools.tools["search_fetch"]("x", backend="marginalia")
+        tools.tools["fetch_many"](["https://example.test"])
+        tools.tools["proxy_status"]()
+
+    def test_isolate_reaches_search_and_crawl(self, monkeypatch, server):
+        calls = []
+        tools = self._server(monkeypatch, calls)
+        tools.tools["search"]("x", backend="marginalia", isolate=False)
+        assert calls[-1]["isolate"] is False
+        tools.tools["crawl"](server.url("/"), depth=0, isolate=False)
+        assert calls[-1]["isolate"] is False
+
+    def test_search_passes_searxng_and_range_options(self, monkeypatch, server):
+        calls = []
+        tools = self._server(monkeypatch, calls)
+        out = tools.tools["search"]("x", backend="searxng",
+                                    search_url="https://searx.example", time_range="week",
+                                    include_sponsored=True)
+        assert "backends_tried" in out

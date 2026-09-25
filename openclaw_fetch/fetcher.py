@@ -27,7 +27,8 @@ from .cache import TtlCache, has_cookies
 from .errors import FetchError, error_result, exit_code_for
 from .parse import parse_document
 from .result import Result
-from .util import estimate_tokens, host_of, public_ip_addresses, redact_url
+from .util import (RawBody, estimate_tokens, host_of, public_ip_addresses,
+                   raw_text, redact_url)
 
 NETWORKS = ("normal", "tor", "i2p", "auto")
 NETWORK_LABEL = {"normal": "NORMAL", "tor": "TOR", "i2p": "I2P", "auto": "AUTO"}
@@ -309,7 +310,7 @@ class _RobotsGuard:
             keep_raw=True,
             _skip_guards=True,
         )
-        raw = resp.get("_raw_body") or resp.get("text") or ""
+        raw = raw_text(resp)
         if not resp.ok and resp.get("status") not in (404, 401, 403):
             return "*"  # robots unreachable -> allow (never hard-block)
         return _parse_robots(raw)
@@ -397,6 +398,41 @@ class Fetcher:
         ttl = cache_ttl if cache_ttl is not None else opts.get("cache_ttl", config.DEFAULT_CACHE_TTL)
         self.cache = TtlCache(cache_dir=cache_dir, ttl=ttl, enabled=use_cache)
         self._cache_safe = bool(use_cache)
+
+    def clone(self, **overrides):
+        """A new Fetcher with the same configuration, minus per-call state.
+
+        Used when one logical operation needs two different output budgets (an
+        untruncated search-engine page plus truncated article pages) while
+        keeping identical network, proxy, cookie and header behaviour.
+        """
+        options = {
+            "network": self.network,
+            "tor_proxy": self.tor_proxy,
+            "i2p_proxy": self.i2p_proxy,
+            "timeout": self.timeout,
+            "connect_timeout": self.connect_timeout,
+            "retries": self.retries,
+            "retry_backoff": self.retry_backoff,
+            "cookie_jar": self.cookie_jar,
+            "cache_dir": self.cache.cache_dir,
+            "cache_ttl": self.cache.ttl,
+            "use_cache": self.cache.enabled,
+            "max_bytes": self.max_bytes,
+            "max_links": self.max_links,
+            "max_chars": self.max_chars,
+            "max_redirects": self.max_redirects,
+            "respect_robots": self.respect_robots,
+            "rate_limit": self.rate_limit,
+            "no_private_ip": self.no_private_ip,
+            "expect": self.expect,
+            "isolate": self.isolate,
+            "headers": dict(self._extra_headers),
+            "ua": self.ua,
+            "allow_errors": self.allow_errors,
+        }
+        options.update(overrides)
+        return Fetcher(**options)
 
     # -- sessions ---------------------------------------------------------
     def _session(self, network=None):
@@ -795,7 +831,9 @@ class Fetcher:
             rendered_text = kind["text"]
 
         expect_error = self._expect_check(kind["kind"])
-        if expect_error and not eff_allow_errors:
+        if expect_error:
+            # --expect is a contract, not a hint: a mismatch stays a failure even
+            # with allow_errors (which is about 4xx/5xx *bodies*).
             ok = False
         result = Result(
             ok=ok,
@@ -832,7 +870,7 @@ class Fetcher:
         )
         if self.isolate and net == "tor":
             result["metadata"]["isolated"] = True
-        if expect_error and not eff_allow_errors:
+        if expect_error:
             result["error"] = expect_error
         if not ok:
             result["error_code"] = result["error_code"] or "HTTP"
@@ -856,7 +894,7 @@ class Fetcher:
                 context=cache_context,
             )
         if keep_raw:
-            result["_raw_body"] = text
+            result["_raw_body"] = RawBody(body)
         return result
 
     def post(self, url, *, data=None, form=True, headers=None, keep_raw=False, **kwargs):
@@ -892,7 +930,13 @@ class Fetcher:
         return self.check_proxy_for(self.network)
 
     def check_proxy_for(self, network):
-        """Probe one concrete network and report reachability."""
+        """Probe one concrete network and report reachability.
+
+        ``network="auto"`` probes every network and returns the same shape as
+        :meth:`check_proxy`.
+        """
+        if _normalize_network(network) == "auto":
+            return self.check_proxy()
         probes = {
             "tor": "http://check.torproject.org/api/ip",
             "i2p": "http://i2p-projekt.i2p/",
@@ -1009,7 +1053,7 @@ class Fetcher:
             proxy_used=redact_url(self.proxy_url(net)) or None,
         )
         if keep_raw:
-            result["_raw_body"] = body.decode("utf-8", errors="replace")
+            result["_raw_body"] = RawBody(body)
         return result
 
     def fetch_many(self, urls, concurrency=4, keep_raw=False):
@@ -1076,14 +1120,44 @@ def _truncate(text, max_chars, what="text"):
     )
 
 
-def fetch(url, **kwargs):
-    """Fetch a single URL through the default normal network (or override)."""
-    keep_raw = kwargs.pop("keep_raw", False)
-    return Fetcher(**kwargs).fetch(url, keep_raw=keep_raw)
+_FORMATS = ("text", "markdown", "raw", "html")
 
 
-def fetch_many(urls, concurrency=4, **kwargs):
+def _apply_format(result, fmt):
+    """Promote one field to ``result["text"]`` per the requested format.
+
+    Applied by the convenience wrappers only: ``Fetcher`` always returns every
+    field, and the CLI/MCP layers choose what to print.
+    """
+    if not fmt or fmt == "text":
+        return result
+    if fmt not in _FORMATS:
+        raise FetchError("USAGE", "unknown format %r (use %s)" % (fmt, "|".join(_FORMATS)))
+    if not result.ok:
+        return result
+    if fmt == "raw":
+        result["text"] = raw_text(result)
+    elif fmt == "html":
+        result["text"] = result.get("text") or result.get("markdown") or ""
+    else:
+        result["text"] = result.get("markdown") or result.get("text") or ""
+    return result
+
+
+def fetch(url, format="text", **kwargs):
+    """Fetch a single URL through the default normal network (or override).
+
+    ``format`` picks which field is promoted into ``result["text"]``
+    (``text``/``markdown``/``raw``/``html``); every field is always present.
+    """
+    keep_raw = kwargs.pop("keep_raw", True)
+    result = Fetcher(**kwargs).fetch(url, keep_raw=keep_raw)
+    return _apply_format(result, format)
+
+
+def fetch_many(urls, concurrency=4, format="text", **kwargs):
     """Fetch many URLs, returning results in input order."""
-    keep_raw = kwargs.pop("keep_raw", False)
+    keep_raw = kwargs.pop("keep_raw", True)
     fetcher = Fetcher(**kwargs)
-    return fetcher.fetch_many(urls, concurrency=concurrency, keep_raw=keep_raw)
+    results = fetcher.fetch_many(urls, concurrency=concurrency, keep_raw=keep_raw)
+    return [_apply_format(r, format) for r in results]

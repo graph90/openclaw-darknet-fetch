@@ -3,6 +3,8 @@
 import json
 import sys
 
+from .util import raw_bytes
+
 
 def _public(result):
     if isinstance(result, dict):
@@ -52,6 +54,31 @@ def human_separator():
     return "\n\n" + "~" * 60 + "\n"
 
 
+def _binary_stream(out):
+    """Return a byte-writable view of ``out`` (text streams get ``.buffer``)."""
+    buffer = getattr(out, "buffer", None)
+    if buffer is not None:
+        return buffer
+    return _TextFallback(out)
+
+
+class _TextFallback:
+    """Encode bytes for callers that hand us a text-only stream (tests, StringIO)."""
+
+    def __init__(self, out):
+        self._out = out
+
+    def write(self, data):
+        if isinstance(data, bytes):
+            data = data.decode("utf-8", errors="replace")
+        return self._out.write(data)
+
+    def flush(self):
+        flush = getattr(self._out, "flush", None)
+        if flush is not None:
+            flush()
+
+
 def render(results, fmt="human", *, out=None):
     """Render one or many result dicts for the requested format."""
     out = out if out is not None else sys.stdout
@@ -65,9 +92,11 @@ def render(results, fmt="human", *, out=None):
             out.write("\n")
         return
     if fmt == "raw":
+        # --raw means the original bytes, so bypass the text layer entirely.
+        binary = _binary_stream(out)
         for result in results:
-            out.write(result.get("_raw_body", result.get("text", "")))
-        out.write("\n")
+            binary.write(raw_bytes(result))
+        binary.flush()
         return
     if fmt == "text":
         _render_bodies(results, "text", out)

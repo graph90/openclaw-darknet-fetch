@@ -192,3 +192,32 @@ class TestBackendSelection:
 
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(pytest.main([__file__]))
+
+
+class TestEmptyVersusFailed:
+    def test_all_engines_failed_is_not_ok(self):
+        stub = StubFetcher({})  # every fetch fails
+        res = search("x", network="normal", fetcher=stub)
+        assert res.ok is False
+        assert res.error_code
+        assert res["backends_failed"]
+
+    def test_engines_answered_with_zero_hits_is_ok(self):
+        stub = StubFetcher({"marginalia": "<html><body>nothing here</body></html>",
+                            "ddg": "<html><body>nothing here</body></html>"})
+        res = search("x", network="normal", fetcher=stub)
+        assert res.ok is True
+        assert res.total_results == 0
+        assert res["backends_failed"] == []
+
+    def test_one_engine_empty_one_failed_still_ok(self):
+        stub = StubFetcher({"marginalia": "<html><body>nothing</body></html>"})
+        res = search("x", network="normal", fetcher=stub)
+        assert res.ok is True
+        assert res.total_results == 0
+
+    def test_results_carry_failed_backend_list(self):
+        stub = StubFetcher({"tor66": MARGINALIA_THROTTLE})
+        res = search("x", network="tor", fetcher=stub)
+        assert res.ok is False
+        assert "tor66" in res["blocked_backends"]

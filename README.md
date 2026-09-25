@@ -120,10 +120,15 @@ openclaw-fetch -t URL --json
 openclaw-fetch -t URL --format markdown --max-chars 6000
 ```
 
-### Raw HTML
+### Raw bytes
+
+`--raw` writes the *original* response bytes to stdout (no text decoding);
+`--save-raw PATH` also saves them — a file for a single URL, a directory for many.
+Handy for images, PDFs, torrents and anything the extractor would flatten.
 
 ```bash
-openclaw-fetch -t URL --raw
+openclaw-fetch -t http://host.onion/logo.png --raw > logo.png
+openclaw-fetch -n https://a.example/1 https://a.example/2 --save-raw ./saved
 ```
 
 ### Batch
@@ -189,7 +194,8 @@ from openclaw_fetch import fetch, fetch_many, Fetcher, search, search_fetch, cra
 
 r = fetch("https://example.com", network="tor", format="markdown", max_chars=6000)
 # r.ok, r.status, r.final_url, r.title, r.text, r.markdown, r.links, r.metadata,
-# r.items (RSS), r.payload_extracted (SPA JSON), r.estimated_tokens
+# r["items"] / r.feed_items (RSS — r.items is dict.items), r.payload_extracted
+# (SPA JSON), r.estimated_tokens, r.proxy_used, r.target_tld
 
 results = fetch_many([url1, url2, url3], network="tor", concurrency=4)
 
@@ -207,13 +213,24 @@ crawl_result = crawl("http://seed.example/", depth=2, max_pages=20)
 Note: `search_fetch` and `crawl` return dicts (bundle/crawl stats + pages),
 while `fetch`/`fetch_many`/`search` return `Result` objects.
 
+Every result (success *or* failure) carries the same keys, so agents can index
+them uniformly: `ok`, `error`, `error_code`, `network`, `requested_url`,
+`final_url`, `status`, `content_kind`, `title`, `text`, `markdown`, `links`,
+`items`, `metadata`, `redirect_chain`, `cached`, `target_tld`, `took_ms`,
+`proxy_used`. `crawl()` adds `pages_succeeded`/`pages_failed` and is `ok=False`
+unless at least one page came back readable.
+
+`--expect` is a contract, not a hint: a mismatch is a failure (exit 5) even with
+`--allow-errors`, which is about 4xx/5xx *bodies*.
+
 ---
 
 ## Key Flags
 
 | Flag | Purpose |
 |---|---|
-| `--format human\|text\|markdown\|json\|jsonl\|raw` | Output format |
+| `--format human\|text\|markdown\|json\|jsonl\|raw` | Output format (`raw` = original bytes) |
+| `--save-raw PATH` | Also save raw bodies to a file/dir |
 | `--max-chars N` | Cap returned text/markdown length |
 | `--max-links N` | Cap links returned per result |
 | `--max-bytes N` | Hard body cap (decompression-bomb guard) |
@@ -226,7 +243,7 @@ while `fetch`/`fetch_many`/`search` return `Result` objects.
 | `--check-proxy` | Probe network/proxy reachability (reports exit IP over Tor) |
 | `--tor-proxy URL`, `--i2p-proxy URL` | Proxy overrides |
 | `--isolate`, `--no-isolate` | One Tor circuit per request (default on) |
-| `--search QUERY` | Search instead of fetching (auto backend) |
+| `--search QUERY` | Search instead of fetching (backend defaults to `auto`) |
 | `--search-backend auto\|ddg\|ahmia\|tor66\|marginalia\|URL` | Search engine; a URL = SearXNG instance |
 | `--search-fetch-top N` | After searching, fetch top N hits |
 | `--time-range day\|week\|month\|year` | Search time filter |
@@ -259,11 +276,13 @@ The tool is model-agnostic.
 ## Tests
 
 ```bash
-python -m pytest
+python -m pytest              # offline only (default: -m "not live")
+python -m pytest -m live      # the two tests that really touch Tor/I2P/clearnet
 ```
 
 The suite uses a local HTTP server plus an in-process fake SOCKS5 proxy, so the Tor
-code path runs in CI without real Tor.
+code path runs in CI without real Tor. Tests that need real proxies are marked
+`live` and deselected by default.
 
 ---
 

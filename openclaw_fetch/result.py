@@ -5,11 +5,19 @@
     r["ok"]         # same as r.ok
     dict(r)         # plain copy
 Json-serializable via ``json.dumps(r)``.
+
+Caveat: ``r.items`` is ``dict.items`` (the method wins over attribute access),
+so feed entries are always read as ``r["items"]`` or ``r.feed_items``.
 """
 
 
 class Result(dict):
     __slots__ = ()
+
+    @property
+    def feed_items(self):
+        """RSS/Atom entries; alias for ``r["items"]`` that cannot collide."""
+        return self.get("items") or []
 
     def __getattr__(self, name):
         try:

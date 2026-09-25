@@ -94,44 +94,58 @@ def _build_server(network="normal", **defaults):
 
     @mcp.tool()
     def crawl(seed_url: str, depth: int = 1, max_pages: int = 10,
-              network: Optional[str] = None, concurrency: int = 3) -> dict:
+              network: Optional[str] = None, concurrency: int = 3,
+              isolate: Optional[bool] = None) -> dict:
         """Crawl up to `depth` hops from a seed URL, bounded by max_pages."""
         from .crawl import crawl as run_crawl
 
-        options = base_kwargs(network=network)
+        options = base_kwargs(network=network, isolate=isolate)
         fetcher_options = {k: v for k, v in options.items() if k != "network"}
         return run_crawl(
             seed_url, depth=depth, max_pages=max_pages,
             network=selected_network(network), concurrency=concurrency,
-            same_host=True, fetcher_kwargs=fetcher_options,
+            same_host=True, **fetcher_options,
         )
 
     @mcp.tool()
     def search(query: str, network: Optional[str] = None, backend: str = "auto",
-               max_results: int = 8) -> dict:
-        """Search the web (DuckDuckGo / Ahmia / SearXNG) over a network."""
+               max_results: int = 8, search_url: Optional[str] = None,
+               time_range: str = "", include_sponsored: bool = False,
+               isolate: Optional[bool] = None) -> dict:
+        """Search over a network; engine auto-picks per network.
+
+        Backends: tor66 + ahmia (onion indexes) over Tor, marginalia + ddg on the
+        clearnet, or pass `search_url` for your own SearXNG instance.
+        """
         from .search import search as run_search
 
-        options = base_kwargs(network=network)
+        options = base_kwargs(network=network, isolate=isolate)
         fetcher_options = {k: v for k, v in options.items() if k != "network"}
+        # the engine page itself must not be truncated; results are parsed, not read
         fetcher_options["max_chars"] = 0
         return run_search(
             query, network=selected_network(network), backend=backend,
-            max_results=max_results, **fetcher_options,
+            max_results=max_results, search_url=search_url,
+            time_range=time_range or "",
+            include_sponsored=bool(include_sponsored),
+            **fetcher_options,
         )
 
     @mcp.tool()
     def search_fetch(query: str, top_n: int = 3, network: Optional[str] = None,
-                     backend: str = "auto") -> dict:
+                     backend: str = "auto", search_url: Optional[str] = None,
+                     isolate: Optional[bool] = None) -> dict:
         """Search, then fetch the top results through the same network."""
         from .search import search_fetch as run_search_fetch
 
-        options = base_kwargs(network=network)
+        options = base_kwargs(network=network, isolate=isolate)
         fetcher_options = {k: v for k, v in options.items() if k != "network"}
+        # search page untruncated, but the fetched pages keep the caller's cap
         fetcher_options["max_chars"] = 0
         return run_search_fetch(
             query, top_n=top_n, network=selected_network(network),
-            backend=backend, **fetcher_options,
+            backend=backend, search_url=search_url,
+            search_kwargs={"max_chars": 0}, **fetcher_options,
         )
 
     @mcp.tool()
