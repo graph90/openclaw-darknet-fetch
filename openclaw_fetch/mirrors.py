@@ -20,7 +20,7 @@ def _domain_of(site_or_url):
 
 
 def find_mirrors(site_or_url, *, network="auto", fetcher=None, include_sponsored=False,
-                 **fetcher_kwargs):
+                 dry_run=False, **fetcher_kwargs):
     """Return ``{ok, clearnet, onions[], i2ps[], sources[]}`` for ``site_or_url``.
 
     ``sources[]`` entries are ``{"url", "source"}`` where source is one of
@@ -33,6 +33,17 @@ def find_mirrors(site_or_url, *, network="auto", fetcher=None, include_sponsored
 
     started = _now_iso()
     host, clearnet_url = _domain_of(site_or_url)
+    if dry_run:
+        from .util import estimate_tokens
+
+        return Result(
+            ok=True, error="", error_code=None, query=site_or_url,
+            clearnet=None if host.endswith((".onion", ".i2p")) else clearnet_url,
+            onions=[], i2ps=[], sources=[], dry_run=True,
+            projected_searches=["tor66", "marginalia", "ddg"],
+            projected_tokens_total=3 * estimate_tokens("x" * 2000),
+            fetched_at=started,
+        )
     is_onion = host.endswith(".onion")
     is_i2p = host.endswith(".i2p")
     clearnet = None if (is_onion or is_i2p) else clearnet_url

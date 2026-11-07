@@ -1,0 +1,17 @@
+# Example openclaw-fetch configuration (copy to ~/.config/openclaw-fetch/config.toml)
+# Precedence: defaults < config file < OPENCLAW_* env < CLI arguments.
+
+[general]
+max_chars = 12000
+timeout = 30
+
+[tor]
+tor_proxy = "socks5h://127.0.0.1:9050"
+isolate = true
+
+[i2p]
+i2p_proxy = "http://127.0.0.1:4444"
+
+[cache]
+cache_ttl = 3600
+cache_dir = "~/.cache/openclaw-fetch"

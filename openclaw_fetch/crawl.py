@@ -5,6 +5,8 @@ deduplicated by normalized URL, using the shared disk cache so already-fetched
 pages are never re-downloaded (that also makes ``crawl`` idempotent for retries).
 """
 
+import json
+import os
 import time
 from collections import deque
 from urllib.parse import urljoin, urlparse
@@ -12,6 +14,38 @@ from urllib.parse import urljoin, urlparse
 from . import config
 from .result import Result
 from .util import normalize_url
+
+
+def _save_checkpoint(path, seed, depth, frontier, visited):
+    payload = {
+        "seed_url": seed,
+        "depth_target": depth,
+        "frontier": [[u, d] for u, d in frontier],
+        "visited": sorted(visited),
+    }
+    try:
+        directory = os.path.dirname(os.path.expanduser(path))
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        tmp = os.path.expanduser(path) + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh)
+        os.replace(tmp, os.path.expanduser(path))
+    except OSError:
+        pass
+
+
+def _load_checkpoint(path, seed, depth):
+    try:
+        with open(os.path.expanduser(path), "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    if data.get("seed_url") != seed or data.get("depth_target") != int(depth):
+        return None
+    frontier = deque((u, int(d)) for u, d in (data.get("frontier") or []))
+    visited = set(data.get("visited") or [])
+    return frontier, visited
 
 
 def _is_same_host(url, seed_host):
@@ -25,7 +59,7 @@ def _is_http(url):
 
 def crawl(seed_url, depth=1, max_pages=10, *, network="normal", fetcher=None,
           same_host=True, concurrency=3, max_links=80, time_budget=None,
-          **fetcher_kwargs):
+          checkpoint=None, **fetcher_kwargs):
     """Breadth-first crawl from ``seed_url``. Returns a result dict with a
     ``pages`` list (each page carries a ``depth`` field) plus crawl stats.
 
@@ -60,6 +94,12 @@ def crawl(seed_url, depth=1, max_pages=10, *, network="normal", fetcher=None,
     pages = {}          # url -> result dict
     visited = set()
     frontier = deque([(seed, 0)])
+    resumed = False
+    if checkpoint:
+        loaded = _load_checkpoint(checkpoint, seed, depth)
+        if loaded is not None:
+            frontier, visited = loaded
+            resumed = bool(visited or frontier)
     links_discovered = 0
     max_depth_reached = 0
     frontier_exhausted = True
@@ -67,6 +107,8 @@ def crawl(seed_url, depth=1, max_pages=10, *, network="normal", fetcher=None,
     budget_reached = False
 
     while frontier:
+        if checkpoint:
+            _save_checkpoint(checkpoint, seed, depth, frontier, visited)
         if len(pages) >= max_pages:
             max_pages_reached = True
             frontier_exhausted = bool(frontier)
@@ -145,7 +187,16 @@ def crawl(seed_url, depth=1, max_pages=10, *, network="normal", fetcher=None,
         max_pages_reached=max_pages_reached,
         frontier_exhausted=frontier_exhausted,
         time_budget_reached=budget_reached,
+        checkpoint_resumed=resumed,
         pages=page_list,
     )
+    if checkpoint:
+        if frontier_exhausted and not max_pages_reached and not budget_reached:
+            try:
+                os.remove(os.path.expanduser(checkpoint))
+            except OSError:
+                pass
+        else:
+            _save_checkpoint(checkpoint, seed, depth, frontier, visited)
     result["took_ms"] = int((time.monotonic() - t0) * 1000)
     return result

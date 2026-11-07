@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "openclaw-fetch"
-version = "0.5.0"
+version = "0.6.0"
 description = "Multi-network (Normal/Tor/I2P) fetcher toolkit for AI agents"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -18,7 +18,9 @@ dependencies = [
 [project.optional-dependencies]
 pdf = ["pypdf"]
 mcp = ["mcp"]
-all = ["pypdf", "mcp"]
+tor = ["stem"]
+render = []
+all = ["pypdf", "mcp", "stem"]
 
 [project.scripts]
 openclaw-fetch = "openclaw_fetch.cli:main"

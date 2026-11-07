@@ -72,10 +72,20 @@ def doctor(network="auto", tor_proxy=None, i2p_proxy=None, isolate=True, timeout
     # ControlPort probe (only meaningful for Tor).
     control_ok = False
     control_detail = "not probed (network=%s)" % net
+    bootstrap = None
     if net in ("auto", "tor"):
         ok, err = _reachable("127.0.0.1", 9051, timeout=timeout)
         control_ok = ok
         control_detail = "reachable" if ok else ("unreachable: %s" % err)
+        if ok:
+            try:
+                from .tor_control import TorControl
+
+                bootstrap = TorControl("127.0.0.1", 9051, timeout=timeout).bootstrap_phase()
+                control_detail = "reachable (bootstrap: %s)" % bootstrap
+            except Exception as exc:
+                control_detail = "reachable (bootstrap unavailable: %s)" % exc
+                bootstrap = None
         checks.append({"name": "tor_controlport", "ok": ok, "detail": control_detail})
 
     if not isolate:
@@ -91,6 +101,7 @@ def doctor(network="auto", tor_proxy=None, i2p_proxy=None, isolate=True, timeout
         "network": net.upper(),
         "checks": checks,
         "isolation": isolation,
+        "bootstrap": bootstrap,
         "tor_proxy": redact_url(tor_proxy),
         "i2p_proxy": redact_url(i2p_proxy),
         "torrc_hints": list(TOR_CONTROL_HINTS),

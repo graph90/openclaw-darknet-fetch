@@ -237,6 +237,33 @@ def _build_server(network="normal", **defaults):
         """Approximate how many tokens a text body will consume."""
         return {"text_length": len(text), "estimated_tokens": estimate_tokens(text)}
 
+    @mcp.tool()
+    def watch(url: str, interval: float = 5, max_polls: int = 3,
+              network: Optional[str] = None, until_change: bool = False,
+              isolate: Optional[bool] = None) -> dict:
+        """Poll a URL and report changes (ETag/hash-based)."""
+        from .watch import watch as run_watch
+
+        options = base_kwargs(network=network, isolate=isolate)
+        fetcher_options = {k: v for k, v in options.items() if k != "network"}
+        return run_watch(
+            url, interval=interval, max_polls=max_polls, until_change=bool(until_change),
+            network=selected_network(network), **fetcher_options,
+        )
+
+    @mcp.tool()
+    def estimate(urls: list, avg_chars: int = 2000) -> dict:
+        """Project token cost for fetching ``urls`` (no network calls)."""
+        from .util import estimate_tokens
+
+        per_page = estimate_tokens("x" * max(1, int(avg_chars)))
+        return {
+            "page_count": len(urls),
+            "avg_chars": int(avg_chars),
+            "estimated_tokens_per_page": per_page,
+            "estimated_tokens_total": per_page * len(urls),
+        }
+
     return mcp
 
 

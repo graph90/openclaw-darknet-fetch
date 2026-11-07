@@ -160,3 +160,84 @@ def raw_bytes(result, default=b""):
     if isinstance(body, bytes):
         return body
     return str(body).encode("utf-8", errors="replace")
+
+
+# -- SimHash near-duplicate detection (v0.6) ----------------------------------
+def simhash(text, bits=64):
+    """64-bit SimHash of ``text`` (word-tokenized, FNV-free hash)."""
+    import hashlib
+
+    if not text:
+        return 0
+    tokens = re.findall(r"[a-z0-9]{2,}", text.lower())
+    if not tokens:
+        return 0
+    weights = [0] * bits
+    for tok in set(tokens):
+        digest = int.from_bytes(hashlib.sha1(tok.encode("utf-8")).digest()[:8], "big")
+        for i in range(bits):
+            weights[i] += 1 if (digest >> i) & 1 else -1
+    fingerprint = 0
+    for i, w in enumerate(weights):
+        if w > 0:
+            fingerprint |= 1 << i
+    return fingerprint
+
+
+def hamming(a, b):
+    """Hamming distance between two integers (xor popcount)."""
+    return bin(int(a) ^ int(b)).count("1")
+
+
+def near_duplicates(texts, threshold=3):
+    """Return indices that are near-duplicates of an earlier text.
+
+    ``texts`` is a list of strings; returns ``[i, ...]`` for every ``i`` whose
+    SimHash is within ``threshold`` bits of any earlier text.
+    """
+    seen = []
+    dupes = []
+    for i, text in enumerate(texts):
+        h = simhash(text or "")
+        if any(hamming(h, prev) <= threshold for prev in seen):
+            dupes.append(i)
+        else:
+            seen.append(h)
+    return dupes
+
+
+# -- cheap offline language detection (v0.6) ----------------------------------
+_LANG_STOPWORDS = {
+    "en": ["the", "and", "of", "to", "is", "in", "for", "that", "with", "this"],
+    "es": ["el", "la", "de", "que", "y", "en", "los", "del", "una", "para"],
+    "fr": ["les", "des", "une", "est", "pour", "dans", "que", "qui", "sur", "avec"],
+    "de": ["und", "der", "die", "das", "ein", "eine", "von", "mit", "für", "ist"],
+    "ru": ["и", "в", "не", "что", "он", "на", "я", "бы", "с", "по"],
+}
+
+
+def detect_language(text):
+    """Guess language from stopword frequencies.
+
+    Returns ``{"lang": code, "confidence": 0.0..1.0, "scores": {...}}``.
+    Never raises; empty text yields ``{"lang": "unknown", "confidence": 0.0}``.
+    """
+    if not text or not str(text).strip():
+        return {"lang": "unknown", "confidence": 0.0, "scores": {}}
+    tokens = re.findall(r"[^\s]+", text.lower())
+    tokens = [t.strip(".,;:!?()[]{}<>\"'") for t in tokens]
+    scores = {}
+    for lang, stopwords in _LANG_STOPWORDS.items():
+        scores[lang] = sum(1 for t in tokens if t in stopwords)
+    best_lang = max(scores, key=scores.get) if scores else "unknown"
+    best = scores.get(best_lang, 0)
+    second = sorted(scores.values(), reverse=True)[1] if len(scores) > 1 else 0
+    if best == 0:
+        return {"lang": "unknown", "confidence": 0.0, "scores": scores}
+    confidence = best / (best + second) if (best + second) else 0.0
+    return {"lang": best_lang, "confidence": round(confidence, 3), "scores": scores}
+
+
+def estimate_total_tokens(texts):
+    """Sum of :func:`estimate_tokens` over an iterable of texts."""
+    return sum(estimate_tokens(t) for t in (texts or []))

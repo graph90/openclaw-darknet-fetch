@@ -106,6 +106,11 @@ _READ_SHAPE = {
     "exit_verified": False,
     "suspected_dead": False,
     "extracted": [],
+    # v0.6: circuit provenance.
+    "circuit_id": None,
+    "guard": None,
+    "exit_node": None,
+    "exit_country": None,
 }
 
 

@@ -31,7 +31,8 @@ from .doctor import doctor
 from .deep import deep_fetch
 from .mirrors import find_mirrors
 from .documents import collect_documents
-from .util import estimate_tokens
+from .watch import watch
+from .util import detect_language, estimate_tokens, estimate_total_tokens, hamming, near_duplicates, simhash
 from .version import __version__
 
 __all__ = [
@@ -50,7 +51,13 @@ __all__ = [
     "deep_fetch",
     "find_mirrors",
     "collect_documents",
+    "watch",
+    "detect_language",
     "estimate_tokens",
+    "estimate_total_tokens",
+    "simhash",
+    "hamming",
+    "near_duplicates",
     "FetchError",
     "Result",
     "exit_code_for",

@@ -449,6 +449,10 @@ class Fetcher:
         interstitial_wait=1.0,
         dead_ledger=None,
         dead_threshold=3,
+        newnym_on_fail=0,
+        tor_control=None,
+        i2p_jump=None,
+        via_archive=False,
     ):
         opts = config.resolve({}, config_path=config_path)
         self.config_path = os.path.expanduser(config_path) if config_path else None
@@ -469,6 +473,11 @@ class Fetcher:
         self.interstitial_wait = float(interstitial_wait)
         self.dead_ledger = dead_ledger
         self.dead_threshold = int(dead_threshold)
+        self.newnym_on_fail = int(newnym_on_fail or 0)
+        self.tor_control = tor_control or "127.0.0.1:9051"
+        self.i2p_jump = i2p_jump
+        self.via_archive = bool(via_archive)
+        self._tor_consecutive_fails = 0
         self._exit_cache = {}
         self._dead_lock = threading.Lock()
         self.log_jsonl = log_jsonl
@@ -548,6 +557,10 @@ class Fetcher:
             "interstitial_wait": self.interstitial_wait,
             "dead_ledger": self.dead_ledger,
             "dead_threshold": self.dead_threshold,
+            "newnym_on_fail": self.newnym_on_fail,
+            "tor_control": self.tor_control,
+            "i2p_jump": self.i2p_jump,
+            "via_archive": self.via_archive,
             "log_jsonl": self.log_jsonl,
             "budget_seconds": self.budget_seconds,
             "budget_bytes": self.budget_bytes,
@@ -857,6 +870,92 @@ class Fetcher:
             ledger[host] = entry
             self._save_dead(ledger)
 
+    # -- circuit provenance / NEWNYM (v0.6) --------------------------------
+    def _control(self):
+        from .tor_control import TorControl
+
+        host, _, port = (self.tor_control or "127.0.0.1:9051").partition(":")
+        return TorControl(host=host or "127.0.0.1", port=int(port or 9051))
+
+    def _maybe_newnym(self, ok):
+        """Send NEWNYM after N consecutive Tor failures. Returns True when sent."""
+        if self.newnym_on_fail <= 0:
+            return False
+        if ok:
+            self._tor_consecutive_fails = 0
+            return False
+        self._tor_consecutive_fails += 1
+        if self._tor_consecutive_fails < self.newnym_on_fail:
+            return False
+        self._tor_consecutive_fails = 0
+        try:
+            return bool(self._control().newnym())
+        except Exception:
+            return False
+
+    def _stamp_circuit(self, result, net):
+        """Stamp circuit fields (None when control is unavailable)."""
+        result["circuit_id"] = result.get("circuit_id")
+        result["guard"] = result.get("guard")
+        result["exit_node"] = result.get("exit_node")
+        result["exit_country"] = result.get("exit_country")
+        if net != "tor":
+            return result
+        try:
+            info = self._control().getinfo("circuit-status")
+        except Exception:
+            return result
+        # circuit-status is multiline; take the first line as the id hint.
+        result["circuit_id"] = info.splitlines()[0][:120] if info else None
+        return result
+
+    # -- I2P jump + archive fallbacks (v0.6) --------------------------------
+    def _try_i2p_jump(self, host):
+        """Try the jump service for ``host``; return the resolved host or None."""
+        if not self.i2p_jump or not host:
+            return None
+        import hashlib
+
+        jumps = [j.strip() for j in str(self.i2p_jump).split(",") if j.strip()]
+        digest = hashlib.md5(host.encode("utf-8", errors="ignore")).hexdigest()[:8]
+        for jump in jumps:
+            jump_host = jump.split("://", 1)[-1].rstrip("/")
+            jump_url = "http://%s/jump/%s/%s/" % (jump_host, digest, host)
+            probe = self.clone(use_cache=False)
+            res = probe._fetch_impl(jump_url, _skip_guards=True)
+            if res.get("ok") or res.get("status") in (301, 302, 307, 308):
+                final = (res.get("final_url") or "").strip()
+                if final:
+                    return final
+                return res.get("requested_url")
+        return None
+
+    def _via_archive(self, clean_url):
+        """Fetch the closest Wayback snapshot of ``clean_url`` (or None)."""
+        probe = Fetcher(
+            network="normal", timeout=max(8, self.timeout), retries=0,
+            use_cache=False, max_bytes=65536, isolate=False,
+        )
+        res = probe._fetch_impl(
+            "https://archive.org/wayback/available?url=" + clean_url,
+            _skip_guards=True,
+        )
+        if not res.get("ok") or not res.get("text"):
+            return None
+        try:
+            payload = json.loads(res["text"])
+            snap = (payload.get("archived_snapshots") or {}).get("closest") or {}
+            url = snap.get("url")
+        except (ValueError, AttributeError):
+            return None
+        if not url:
+            return None
+        probe2 = Fetcher(
+            network="normal", timeout=self.timeout, retries=1,
+            use_cache=False, isolate=False, max_bytes=self.max_bytes,
+        )
+        return probe2._fetch_impl(url, _skip_guards=True)
+
     # -- request loop -----------------------------------------------------
     def _request(self, method, url, network=None, **request_kw):
         """Run a request with bounded retries and validated redirects."""
@@ -1077,11 +1176,87 @@ class Fetcher:
             url, method=method, data=data, form=form, headers=headers,
             allow_errors=allow_errors, keep_raw=keep_raw, selector=selector, _skip_guards=_skip_guards,
         )
+        result = self._post_process_v06(result)
         self._budget_spend(
             content_length=result.get("content_length") or 0,
             tokens=result.get("estimated_tokens") or 0,
         )
         self._log_event(result)
+        return result
+
+    def _post_process_v06(self, result):
+        """v0.6 stacking: outproxy/b32, language, circuits, NEWNYM, fallbacks."""
+        try:
+            host = host_of(result.get("requested_url") or "") or ""
+        except Exception:
+            host = ""
+        try:
+            net_label = (result.get("network") or "").upper()
+        except Exception:
+            net_label = ""
+        # Legacy helper text also exposes language via metadata when present.
+        try:
+            text = result.get("text") or ""
+            if text and not (result.get("metadata") or {}).get("language"):
+                from .util import detect_language
+
+                lang = detect_language(text)
+                if lang.get("lang") != "unknown":
+                    result.setdefault("metadata", {})["language"] = lang["lang"]
+                    result["metadata"]["language_confidence"] = lang["confidence"]
+        except Exception:
+            pass
+        # I2P honesty + b32.
+        if result.get("metadata") is None:
+            result["metadata"] = {}
+        try:
+            if net_label == "I2P" and result.get("target_tld") == "clearnet":
+                result["metadata"]["i2p_outproxy_used"] = True
+            elif net_label == "I2P":
+                result["metadata"]["i2p_outproxy_used"] = False
+            if host.endswith(".b32.i2p"):
+                result["metadata"]["b32_host"] = True
+        except Exception:
+            pass
+        # Circuit provenance + NEWNYM accounting.
+        try:
+            resolved_net = resolve_network(self.network, result.get("requested_url") or "")
+        except Exception:
+            resolved_net = self.network
+        result = self._stamp_circuit(result, resolved_net)
+        if resolved_net == "tor":
+            sent = self._maybe_newnym(bool(result.get("ok")))
+            if sent:
+                result["metadata"]["newnym_sent"] = True
+        # I2P jump fallback on failure.
+        if (
+            not result.get("ok")
+            and self.i2p_jump
+            and host.endswith(".i2p")
+            and not result.get("metadata", {}).get("jump_via")
+        ):
+            jumped = self._try_i2p_jump(host)
+            if jumped:
+                retry = self._fetch_impl(
+                    jumped, method="GET", keep_raw=True, _skip_guards=True,
+                )
+                if retry.get("ok"):
+                    retry["metadata"]["jump_via"] = self.i2p_jump
+                    retry["metadata"]["b32_host"] = host.endswith(".b32.i2p")
+                    return self._stamp_circuit(retry, resolved_net)
+        # Wayback fallback on 404/410/connection failures (clearnet only).
+        if (
+            self.via_archive
+            and not result.get("ok")
+            and result.get("target_tld") == "clearnet"
+            and (result.get("status") in (404, 410) or result.get("error_code") in ("CONNECTION", "REQUEST", "TIMEOUT", "HTTP"))
+            and not result.get("metadata", {}).get("via_archive")
+        ):
+            archived = self._via_archive(result.get("requested_url") or "")
+            if archived and archived.get("ok"):
+                archived["metadata"]["via_archive"] = True
+                archived["metadata"]["archive_original_url"] = result.get("requested_url")
+                return self._stamp_circuit(archived, "normal")
         return result
 
     def _fetch_impl(self, url, method="GET", *, data=None, form=True, headers=None, allow_errors=None, keep_raw=False,

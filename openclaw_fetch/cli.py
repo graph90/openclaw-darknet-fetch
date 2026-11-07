@@ -140,6 +140,14 @@ def build_parser():
     parser.add_argument("--dead-ledger", metavar="PATH",
                         help="Enable the suspected-dead onion ledger at PATH.")
 
+    # -- v0.6 additions ----------------------------------------------------
+    parser.add_argument("--checkpoint", metavar="FILE",
+                        help="Persist crawl frontier/visited to FILE (resumable).")
+    parser.add_argument("--i2p-jump", metavar="HOST",
+                        help="I2P jump-service host for .i2p resolution fallback.")
+    parser.add_argument("--via-archive", action="store_true",
+                        help="On 404/410/connection failure, try the Wayback Machine.")
+
     # -- discovery & workflow ----------------------------------------------
     parser.add_argument("--search", metavar="QUERY",
                         help="Search (Tor66 / Marginalia / DuckDuckGo / Ahmia / SearXNG) "
@@ -397,6 +405,8 @@ def main(argv=None):
         config_path=getattr(args, "config_path", None),
         selector=getattr(args, "selector", None),
         dead_ledger=getattr(args, "dead_ledger", None),
+        i2p_jump=getattr(args, "i2p_jump", None),
+        via_archive=getattr(args, "via_archive", False),
     )
 
     if args.check_proxy:
@@ -579,6 +589,7 @@ def _run_crawl(args, fetcher, network, seed, fmt, json_mode):
         seed, depth=depth, max_pages=args.max_pages,
         network=network, fetcher=fetcher,
         concurrency=args.concurrency or config.DEFAULT_CONCURRENCY,
+        checkpoint=getattr(args, "checkpoint", None),
     )
     _emit_json(result, fmt, json_mode)
     return 0 if result.ok else exit_code_for(result.get("error_code") or "APP_ERROR")

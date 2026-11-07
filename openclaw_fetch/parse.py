@@ -679,8 +679,15 @@ def parse_document(text, *, content_type="", requested_url="", final_url="",
     result["needs_renderer"] = needs_renderer(text, len(result["text"]))
     payload = extract_embedded_json(text)
     if payload and result["needs_renderer"]:
-        result["text"] = payload
-        result["markdown"] = payload
+        flattened = extract_flattened_payload(text)
+        if flattened:
+            result["text"] = flattened
+            result["markdown"] = flattened
+            result["metadata"]["payload_format"] = "flattened"
+        else:
+            result["text"] = payload
+            result["markdown"] = payload
+            result["metadata"]["payload_format"] = "json"
         result["payload_extracted"] = True
     return result
 
@@ -886,3 +893,114 @@ def _try_json_pretty(text):
         return json.dumps(json.loads(text), indent=2, ensure_ascii=False)
     except ValueError:
         return None
+
+
+# -- embedded-payload walking (v0.6, §22.1) ----------------------------------
+_CONTENT_KEYS = (
+    "title", "name", "headline", "body", "content", "text",
+    "description", "excerpt", "summary", "article", "message",
+    "caption", "subtitle",
+)
+
+
+def _walk_payload(obj, candidates=None):
+    """Collect (key, string) leaves from a nested payload structure."""
+    if candidates is None:
+        candidates = []
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            if isinstance(value, str) and value.strip():
+                candidates.append((str(key), value.strip()))
+            elif isinstance(value, bool):
+                candidates.append((str(key), str(value).lower()))
+            elif isinstance(value, (int, float)):
+                candidates.append((str(key), str(value)))
+            elif isinstance(value, (dict, list)):
+                _walk_payload(value, candidates)
+    elif isinstance(obj, list):
+        for item in obj:
+            if isinstance(item, str) and item.strip():
+                candidates.append(("", item.strip()))
+            elif isinstance(item, (int, float)):
+                candidates.append(("", str(item)))
+            elif isinstance(item, (dict, list)):
+                _walk_payload(item, candidates)
+    elif isinstance(obj, str) and obj.strip():
+        candidates.append(("", obj.strip()))
+    return candidates
+
+
+def _content_score(key):
+    low = (key or "").lower()
+    for rank, needle in enumerate(_CONTENT_KEYS):
+        if needle in low:
+            return (len(_CONTENT_KEYS) - rank)
+    return 0
+
+
+def flatten_payload(obj, max_chars=12000):
+    """Flatten a parsed SPA payload to article-like text (no JS engine).
+
+    Content-looking keys (`title`/`body`/`content`/…) are surfaced first so
+    Apollo/Next boilerplate does not drown the article. Falls back to all
+    readable string leaves when no content keys exist. Never raises.
+    """
+    try:
+        if not obj:
+            return ""
+        candidates = _walk_payload(obj)
+        if not candidates:
+            return ""
+        seen = set()
+        scored = []
+        for key, value in candidates:
+            if value in seen:
+                continue
+            seen.add(value)
+            scored.append((_content_score(key), len(value), key, value))
+        scored.sort(key=lambda t: (-t[0], -t[1]))
+        lines = []
+        total = 0
+        for _score, _n, key, value in scored:
+            line = "%s: %s" % (key, value) if key else value
+            total += len(line) + 2
+            if total > max_chars:
+                break
+            lines.append(line)
+        return "\n\n".join(lines).strip()
+    except Exception:
+        return ""
+
+
+def extract_flattened_payload(html, max_chars=12000):
+    """Extract + flatten the first embedded SPA payload found in ``html``.
+
+    Returns flattened article text (or ``""``). ``extract_embedded_json`` keeps
+    returning pretty JSON for the raw form; this is the readable form.
+    """
+    if not html:
+        return ""
+    candidates = []
+    for match in re.finditer(
+        r'<script[^>]+type=["\']application/json["\'][^>]*>(.*?)</script>',
+        html, re.IGNORECASE | re.DOTALL,
+    ):
+        candidates.append(match.group(1).strip())
+    for block in re.finditer(
+        r"window\.(__NEXT_DATA__|__INITIAL_STATE__|store|__NUXT__)\s*=\s*(\{.*?\});",
+        html, re.DOTALL,
+    ):
+        candidates.append(_balanced_json(block.group(2)))
+    for cand in candidates:
+        if not cand:
+            continue
+        try:
+            parsed = json.loads(cand)
+        except ValueError:
+            continue
+        flat = flatten_payload(parsed, max_chars=max_chars)
+        if flat:
+            # Next.js nests the article under props.pageProps and similar.
+            # flatten_payload() walks everything, so the article keys surface.
+            return flat
+    return ""
