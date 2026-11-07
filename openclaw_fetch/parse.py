@@ -22,6 +22,218 @@ SPA_MARKERS = (
     "ng-app", "data-server-rendered", "application/json",
 )
 
+# "Please wait" shells served by darknet front-ends before the real page.
+INTERSTITIAL_MARKERS = (
+    "please wait", "proszę czekać", "bitte warten", "wait a moment",
+    "wait for a moment", "please be patient", "one moment please",
+)
+
+GATED_MARKERS = (
+    "members only", "member only", "you must be logged in",
+    "sign in to continue", "please log in", "join to read",
+)
+
+CHALLENGE_MARKERS = (
+    "captcha", "are you a robot", "checking your browser",
+    "enable javascript and cookies", "prove you are human",
+)
+
+
+def page_label(html, visible_text):
+    """Classify a page for skip logic: interstitial/gated/challenge/None.
+
+    ``html`` is the raw source (for marker search), ``visible_text`` the
+    extracted text. Interstitial requires thin visible text, so a real article
+    that merely mentions "please wait" is not mislabelled.
+    """
+    low_html = (html or "").lower()
+    low_text = (visible_text or "").lower()
+    if len(visible_text or "") < 200 and any(m in low_html or m in low_text for m in INTERSTITIAL_MARKERS):
+        return "interstitial"
+    if any(m in low_text or m in low_html for m in GATED_MARKERS):
+        return "gated"
+    if any(m in low_text or m in low_html for m in CHALLENGE_MARKERS):
+        return "challenge"
+    return None
+
+
+def looks_like_index(text_len, link_count):
+    """Heuristic: many links, little prose -> an index/directory page."""
+    return link_count >= 8 and text_len < 800
+
+
+def index_rows(links):
+    """Structured rows for an index page: [{title,url,kind}]."""
+    return [{"title": l.get("text") or "", "url": l.get("url"), "kind": l.get("kind") or "page"}
+            for l in links or []]
+
+
+# -- minimal CSS selector extraction (v0.5) -----------------------------------
+_CSS_IDENT = re.compile(r"[A-Za-z0-9_-]+")
+_CSS_ATTR = re.compile(r"\[\s*([A-Za-z0-9_-]+)\s*(?:([~|^$*]?=)\s*([^\]]+)\s*)?\]")
+
+
+class _CssNode:
+    __slots__ = ("tag", "attrs", "children", "text_parts", "parent")
+
+    def __init__(self, tag, attrs, parent=None):
+        self.tag = tag
+        self.attrs = attrs or {}
+        self.children = []
+        self.text_parts = []
+        self.parent = parent
+
+    def text(self):
+        out = list(self.text_parts)
+        for child in self.children:
+            out.append(child.text())
+        return _collapse(" ".join(out))
+
+
+class _CssParser(HTMLParser):
+    void = {"br", "hr", "img", "meta", "link", "input"}
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.root = _CssNode("[root]", {})
+        self.stack = [self.root]
+
+    def handle_starttag(self, tag, attrs):
+        node = _CssNode(tag.lower(), {k.lower(): (v or "") for k, v in dict(attrs).items()},
+                        parent=self.stack[-1])
+        self.stack[-1].children.append(node)
+        if tag.lower() not in self.void:
+            self.stack.append(node)
+
+    def handle_startendtag(self, tag, attrs):
+        self.handle_starttag(tag, attrs)
+
+    def handle_endtag(self, tag):
+        tag = tag.lower()
+        for i in range(len(self.stack) - 1, 0, -1):
+            if self.stack[i].tag == tag:
+                del self.stack[i:]
+                return
+
+    def handle_data(self, data):
+        if data and data.strip():
+            self.stack[-1].text_parts.append(data)
+
+
+def _css_parse_simple(selector):
+    """Parse one simple selector into (tag, id, classes, [(attr, op, value)])."""
+    m = re.match(r"\s*([A-Za-z][A-Za-z0-9]*)?", selector)
+    tag = m.group(1).lower() if m and m.group(1) else None
+    rest = selector[m.end():] if m else selector
+    id_ = None
+    classes = []
+    attrs = []
+    pos = 0
+    # strip tag (already consumed); now parse #id, .class, [attr...] in order
+    s = rest.strip()
+    i = 0
+    while i < len(s):
+        if s[i] == ".":
+            m2 = _CSS_IDENT.match(s, i + 1)
+            if not m2:
+                raise ValueError("bad class in selector %r" % selector)
+            classes.append(m2.group(0))
+            i = m2.end()
+        elif s[i] == "#":
+            m2 = _CSS_IDENT.match(s, i + 1)
+            if not m2:
+                raise ValueError("bad id in selector %r" % selector)
+            id_ = m2.group(0)
+            i = m2.end()
+        elif s[i] == "[":
+            m2 = _CSS_ATTR.match(s, i)
+            if not m2:
+                raise ValueError("bad attribute in selector %r" % selector)
+            name = m2.group(1).lower()
+            op = m2.group(2) or ""
+            value = (m2.group(3) or "").strip().strip('"').strip("'")
+            attrs.append((name, op, value))
+            i = m2.end()
+        else:
+            raise ValueError("unsupported selector %r" % selector)
+    if tag is None and id_ is None and not classes and not attrs:
+        raise ValueError("empty selector")
+    return tag, id_, classes, attrs
+
+
+def _css_match(node, simple):
+    tag, id_, classes, attrs = simple
+    if tag and node.tag != tag:
+        return False
+    if id_ and node.attrs.get("id") != id_:
+        return False
+    node_classes = (node.attrs.get("class") or "").split()
+    for cls in classes:
+        if cls not in node_classes:
+            return False
+    for name, op, value in attrs:
+        actual = node.attrs.get(name)
+        if actual is None:
+            return False
+        if op == "=" and actual != value:
+            return False
+        if op == "^=" and not actual.startswith(value):
+            return False
+        if op == "$=" and not actual.endswith(value):
+            return False
+        if op == "*=" and value not in actual:
+            return False
+        if op == "~=" and value not in actual.split():
+            return False
+        if op == "|=" and not (actual == value or actual.startswith(value + "-")):
+            return False
+    return True
+
+
+def _css_descendants(node, simple, out):
+    for child in node.children:
+        if _css_match(child, simple):
+            out.append(child)
+        _css_descendants(child, simple, out)
+
+
+def extract_selector(html, selector, base_url="", max_items=100):
+    """Extract matches for a CSS selector subset from ``html``.
+
+    Supports ``tag``, ``.class``, ``#id``, ``[attr]`` / ``[attr^=]`` /
+    ``[attr$=]`` / ``[attr*=]`` / ``[attr~=]`` / ``[attr|=]`` and space-separated
+    descendant chains. Returns ``[{tag, text, attrs}]``; hrefs are resolved
+    against ``base_url``. Raises ``ValueError`` on bad selectors.
+    """
+    if not isinstance(selector, str) or not selector.strip():
+        raise ValueError("empty CSS selector")
+    parts = selector.strip().split()
+    simples = [_css_parse_simple(p) for p in parts]
+    parser = _CssParser()
+    try:
+        parser.feed(html or "")
+        parser.close()
+    except Exception:
+        pass
+    # Walk the descendant chain step by step.
+    current = [parser.root]
+    for simple in simples:
+        found = []
+        for node in current:
+            _css_descendants(node, simple, found)
+        current = found
+        if not current:
+            return []
+    out = []
+    for node in current:
+        attrs = dict(node.attrs)
+        if "href" in attrs and base_url:
+            attrs["href"] = urljoin(base_url, attrs["href"])
+        out.append({"tag": node.tag, "text": node.text(), "attrs": attrs})
+        if len(out) >= max_items:
+            break
+    return out
+
 
 def _collapse(text):
     return re.sub(r"\s+", " ", text).strip()
@@ -74,6 +286,76 @@ def _is_plain_link_artifact(href):
     if href.startswith("javascript:"):
         return True
     return False
+
+
+# File-extension sets for link classification (Task 4). File kinds win over
+# network kinds so ``http://x.onion/paper.pdf`` reads as a document.
+_DOCUMENT_EXTS = frozenset({
+    ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
+    ".epub", ".txt", ".md", ".csv",
+})
+_ARCHIVE_EXTS = frozenset({
+    ".zip", ".tar", ".gz", ".tgz", ".bz2", ".xz", ".7z", ".rar",
+})
+_DOWNLOAD_EXTS = frozenset({
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".ico",
+    ".mp3", ".mp4", ".avi", ".mov", ".mkv", ".exe", ".deb",
+    ".apk", ".iso", ".dmg", ".torrent", ".bin",
+})
+
+
+def classify_link(url):
+    """Return ``(kind, target_tld)`` for a link URL.
+
+    ``target_tld`` is ``onion``/``i2p``/``clearnet``; ``kind`` is one of
+    ``page``, ``onion``, ``i2p``, ``mail``, ``magnet``, ``document``,
+    ``archive``, ``download``. File kinds win over network kinds.
+    """
+    from urllib.parse import urlsplit
+
+    if not isinstance(url, str) or not url:
+        return "page", "clearnet"
+    low = url.strip().lower()
+    if low.startswith("mailto:"):
+        return "mail", "clearnet"
+    if low.startswith("magnet:"):
+        return "magnet", "clearnet"
+    try:
+        parts = urlsplit(url)
+        host = (parts.hostname or "").lower()
+        path = parts.path or ""
+    except ValueError:
+        return "page", "clearnet"
+    if host.endswith(".onion"):
+        tld = "onion"
+    elif host.endswith(".i2p"):
+        tld = "i2p"
+    else:
+        tld = "clearnet"
+    ext = ""
+    last = path.rsplit("/", 1)[-1].lower()
+    if "." in last:
+        ext = "." + last.rsplit(".", 1)[-1]
+    if ext in _DOCUMENT_EXTS:
+        return "document", tld
+    if ext in _ARCHIVE_EXTS:
+        return "archive", tld
+    if ext in _DOWNLOAD_EXTS:
+        return "download", tld
+    if tld == "onion":
+        return "onion", tld
+    if tld == "i2p":
+        return "i2p", tld
+    return "page", tld
+
+
+def enrich_link(link):
+    """Add ``kind``/``target_tld`` to a link dict in place (returns it)."""
+    url = link.get("url") or ""
+    kind, tld = classify_link(url)
+    link["kind"] = kind
+    link["target_tld"] = tld
+    return link
 
 
 class HTMLDocumentParser(HTMLParser):
@@ -202,7 +484,7 @@ class HTMLDocumentParser(HTMLParser):
         if not label:
             return
         absolute = urljoin(self.base_url, href)
-        self.links.append({"url": absolute, "text": label, "title": title})
+        self.links.append(enrich_link({"url": absolute, "text": label, "title": title}))
         if not self._in_nav():
             if self.current is None:
                 self._start_block("p")
@@ -368,7 +650,7 @@ def parse_document(text, *, content_type="", requested_url="", final_url="",
         result["text"] = feed.get("text", "")
         result["markdown"] = feed.get("text", "")
         result["links"] = [
-            {"url": item["link"], "text": item.get("title", ""), "title": item.get("title", "")}
+            enrich_link({"url": item["link"], "text": item.get("title", ""), "title": item.get("title", "")})
             for item in result["items"][:max_links]
             if item.get("link")
         ]

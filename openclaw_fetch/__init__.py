@@ -21,11 +21,16 @@ are returned as ``ok: false`` with a stable ``error_code``; they are never
 raised as exceptions.
 """
 
-from .fetcher import Fetcher, fetch, fetch_many, validate_url
+from .fetcher import Fetcher, fetch, fetch_many, validate_url, is_valid_onion, onion_info
 from .errors import FetchError, exit_code_for
 from .result import Result
 from .search import search, search_fetch
 from .crawl import crawl
+from .compare import compare, compare_mirrors
+from .doctor import doctor
+from .deep import deep_fetch
+from .mirrors import find_mirrors
+from .documents import collect_documents
 from .util import estimate_tokens
 from .version import __version__
 
@@ -34,9 +39,17 @@ __all__ = [
     "fetch",
     "fetch_many",
     "validate_url",
+    "is_valid_onion",
+    "onion_info",
     "search",
     "search_fetch",
     "crawl",
+    "compare",
+    "compare_mirrors",
+    "doctor",
+    "deep_fetch",
+    "find_mirrors",
+    "collect_documents",
     "estimate_tokens",
     "FetchError",
     "Result",

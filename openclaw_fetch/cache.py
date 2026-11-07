@@ -73,19 +73,24 @@ class TtlCache:
         return {"meta": meta, "body": body}
 
     def put(self, network, url, status, final_url, content_type, content, headers=None,
-            context=None):
+            context=None, fetched_at=None):
         """Store an entry. ``status``/``final_url`` may be ``None`` for errors."""
         if not self.enabled:
             return None
         key = self.key_for(network, url, context=context)
         meta_path, body_path = self._paths(key)
         body = b"" if content is None else content
+        if fetched_at is None:
+            from datetime import datetime, timezone
+
+            fetched_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         meta = {
             "key": key,
             "network": network,
             "url": url,
             "context": context,
             "fetch_time": time.time(),
+            "fetched_at": fetched_at,
             "status": status,
             "final_url": final_url,
             "content_type": content_type,
@@ -113,6 +118,75 @@ class TtlCache:
                     os.remove(os.path.join(base, name))
                 except OSError:
                     pass
+
+    def base_dir(self):
+        """Effective cache directory (explicit or default)."""
+        if self.cache_dir is not None:
+            return self.cache_dir
+        import openclaw_fetch.config as config
+
+        return config.default_cache_dir()
+
+    def stats(self):
+        """Return ``{"entries": N, "bytes": M, "dir": path}`` for the cache."""
+        base = self.base_dir()
+        if not os.path.isdir(base):
+            return {"entries": 0, "bytes": 0, "dir": base}
+        entries = 0
+        total = 0
+        try:
+            names = os.listdir(base)
+        except OSError:
+            return {"entries": 0, "bytes": 0, "dir": base}
+        for name in names:
+            if name.endswith(".json"):
+                entries += 1
+            if name.endswith((".json", ".body")):
+                try:
+                    total += os.path.getsize(os.path.join(base, name))
+                except OSError:
+                    pass
+        return {"entries": entries, "bytes": total, "dir": base}
+
+    def evict_until_under(self, max_mb):
+        """Evict oldest entries until total bytes <= ``max_mb`` MiB. Returns True if evicted."""
+        if max_mb is None:
+            return False
+        try:
+            cap = float(max_mb) * 1024 * 1024
+        except (TypeError, ValueError):
+            return False
+        if cap < 0:
+            return False
+        base = self.base_dir()
+        if not os.path.isdir(base):
+            return False
+        if self.stats()["bytes"] <= cap:
+            return False
+        # Keys sorted oldest-first by meta mtime; remove until under cap.
+        keys = []
+        try:
+            names = os.listdir(base)
+        except OSError:
+            return False
+        for name in names:
+            if not name.endswith(".json"):
+                continue
+            key = name[:-5]
+            try:
+                path = os.path.join(base, name)
+                keys.append((os.path.getmtime(path), key))
+            except OSError:
+                continue
+        keys.sort()
+        evicted = False
+        for _, key in keys:
+            if self.stats()["bytes"] <= cap:
+                break
+            existed = os.path.exists(os.path.join(base, key + ".json"))
+            self._remove(key)
+            evicted = evicted or existed
+        return evicted
 
     def _remove(self, key):
         for path in self._paths(key):

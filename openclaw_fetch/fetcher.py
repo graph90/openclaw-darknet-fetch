@@ -58,6 +58,76 @@ def _target_tld(url):
     return "clearnet"
 
 
+def _now_iso():
+    """Current UTC time as ISO-8601 ``...Z`` (provenance timestamp)."""
+    from datetime import datetime, timezone
+
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def onion_info(host):
+    """Describe an onion host: ``{"is_onion", "valid", "version"}``.
+
+    v3 addresses are 56 base32 chars encoding pubkey(32) + checksum(2) +
+    version(1=0x03); the checksum is the first two bytes of
+    ``SHA3-256(".onion checksum" || pubkey || version)``. Shorter/fake names
+    report ``valid=False`` so typo'd addresses can be flagged without breaking
+    legacy short names when strict mode is off.
+    """
+    if not isinstance(host, str):
+        return {"is_onion": False, "valid": False, "version": None}
+    h = host.strip().lower()
+    if not h.endswith(".onion"):
+        return {"is_onion": False, "valid": False, "version": None}
+    label = h[:-6]
+    version = None
+    valid = False
+    try:
+        if len(label) == 56 and all(c in "abcdefghijklmnopqrstuvwxyz234567" for c in label):
+            import base64
+
+            raw = base64.b32decode(label.upper() + "=" * ((8 - len(label) % 8) % 8))
+            if len(raw) == 35:
+                pubkey, checksum, ver = raw[:32], raw[32:34], raw[34]
+                version = ver
+                want = hashlib.sha3_256(b".onion checksum" + pubkey + bytes([ver])).digest()[:2]
+                valid = ver == 3 and want == checksum
+            else:
+                version = raw[-1] if len(raw) >= 1 else None
+                valid = False
+    except Exception:
+        valid = False
+    return {"is_onion": True, "valid": valid, "version": version}
+
+
+def is_valid_onion(host):
+    """True when ``host`` is a valid v3 onion hostname (checksum-verified)."""
+    info = onion_info(host)
+    return bool(info.get("is_onion") and info.get("valid"))
+
+
+def _response_headers(resp_headers):
+    """Lower-cased snapshot of response headers (safe for results/logs)."""
+    try:
+        return {str(k).lower(): str(v) for k, v in dict(resp_headers or {}).items()}
+    except Exception:
+        return {}
+
+
+def _harvest_mirrors(headers_lower):
+    """Extract onion/I2P mirror hints from lower-cased response headers."""
+    onion = None
+    for key in ("onion-location", "x-onion-location"):
+        if headers_lower.get(key):
+            onion = headers_lower[key].strip()
+            break
+    i2p = []
+    for key, value in headers_lower.items():
+        if key.startswith("x-i2p-") and value and str(value).strip():
+            i2p.append(str(value).strip())
+    return onion, i2p
+
+
 def _is_http_scheme(url):
     parsed = urlparse(url)
     return parsed.scheme in ("http", "https")
@@ -351,6 +421,7 @@ class Fetcher:
         cache_dir=None,
         cache_ttl=None,
         use_cache=True,
+        cache_max_mb=None,
         max_bytes=None,
         max_links=None,
         max_chars=None,
@@ -363,8 +434,24 @@ class Fetcher:
         no_private_ip=False,
         expect=None,
         isolate=None,
+        strict_onion=False,
+        metadata_only=False,
+        budget_seconds=None,
+        budget_bytes=None,
+        budget_requests=None,
+        budget_tokens=None,
+        log_jsonl=None,
+        watch=False,
+        tor_verify=False,
+        config_path=None,
+        selector=None,
+        interstitial_retry=True,
+        interstitial_wait=1.0,
+        dead_ledger=None,
+        dead_threshold=3,
     ):
-        opts = config.resolve({})
+        opts = config.resolve({}, config_path=config_path)
+        self.config_path = os.path.expanduser(config_path) if config_path else None
         self.network = _normalize_network(network)
         self.tor_proxy = tor_proxy or os.environ.get("OPENCLAW_TOR_PROXY") or opts.get("tor_proxy", config.TOR_PROXY_DEFAULT)
         self.i2p_proxy = i2p_proxy or os.environ.get("OPENCLAW_I2P_PROXY") or opts.get("i2p_proxy", config.I2P_PROXY_DEFAULT)
@@ -373,6 +460,28 @@ class Fetcher:
         self.timeout = timeout if timeout is not None else opts.get("timeout", config.DEFAULT_TIMEOUT)
         self.connect_timeout = connect_timeout if connect_timeout is not None else opts.get("connect_timeout", config.DEFAULT_CONNECT_TIMEOUT)
         self.isolate = bool(opts.get("isolate", config.DEFAULT_ISOLATE)) if isolate is None else bool(isolate)
+        self.strict_onion = bool(strict_onion)
+        self.metadata_only = bool(metadata_only)
+        self.watch = bool(watch)
+        self.tor_verify = bool(tor_verify)
+        self.selector = selector
+        self.interstitial_retry = bool(interstitial_retry)
+        self.interstitial_wait = float(interstitial_wait)
+        self.dead_ledger = dead_ledger
+        self.dead_threshold = int(dead_threshold)
+        self._exit_cache = {}
+        self._dead_lock = threading.Lock()
+        self.log_jsonl = log_jsonl
+        self._log_lock = threading.Lock()
+        self.budget_seconds = budget_seconds
+        self.budget_bytes = budget_bytes
+        self.budget_requests = budget_requests
+        self.budget_tokens = budget_tokens
+        self._budget_started = time.monotonic()
+        self._budget_lock = threading.Lock()
+        self._budget_counts = {"requests": 0, "bytes": 0, "tokens": 0}
+        self._validators = {}
+        self._validators_lock = threading.Lock()
 
         self.retries = retries if retries is not None else opts.get("retries", config.DEFAULT_RETRIES)
         self.retry_backoff = retry_backoff if retry_backoff is not None else opts.get("retry_backoff", config.DEFAULT_RETRY_BACKOFF)
@@ -387,6 +496,7 @@ class Fetcher:
         self.rate_limit = rate_limit
         self.no_private_ip = bool(no_private_ip)
         self.expect = expect
+        self.cache_max_mb = cache_max_mb
         self._rate = _RateLimiter(rate_limit) if rate_limit else None
         self._robots = _RobotsGuard(self) if respect_robots else None
         self.ua = ua or opts.get("ua") or config.DEFAULT_UA
@@ -418,6 +528,7 @@ class Fetcher:
             "cache_dir": self.cache.cache_dir,
             "cache_ttl": self.cache.ttl,
             "use_cache": self.cache.enabled,
+            "cache_max_mb": self.cache_max_mb,
             "max_bytes": self.max_bytes,
             "max_links": self.max_links,
             "max_chars": self.max_chars,
@@ -427,6 +538,21 @@ class Fetcher:
             "no_private_ip": self.no_private_ip,
             "expect": self.expect,
             "isolate": self.isolate,
+            "strict_onion": self.strict_onion,
+            "metadata_only": self.metadata_only,
+            "watch": self.watch,
+            "tor_verify": self.tor_verify,
+            "config_path": self.config_path,
+            "selector": self.selector,
+            "interstitial_retry": self.interstitial_retry,
+            "interstitial_wait": self.interstitial_wait,
+            "dead_ledger": self.dead_ledger,
+            "dead_threshold": self.dead_threshold,
+            "log_jsonl": self.log_jsonl,
+            "budget_seconds": self.budget_seconds,
+            "budget_bytes": self.budget_bytes,
+            "budget_requests": self.budget_requests,
+            "budget_tokens": self.budget_tokens,
             "headers": dict(self._extra_headers),
             "ua": self.ua,
             "allow_errors": self.allow_errors,
@@ -534,6 +660,13 @@ class Fetcher:
         code, message = check_route(net, clean_url)
         if code:
             raise FetchError(code, message)
+        if self.strict_onion:
+            info = onion_info(host_of(clean_url) or "")
+            if info.get("is_onion") and not info.get("valid"):
+                raise FetchError(
+                    "ONION_INVALID",
+                    "invalid v3 onion address %r (checksum/version check failed)" % host_of(clean_url),
+                )
         if self.no_private_ip and net == "normal":
             host = host_of(clean_url)
             if not host:
@@ -547,6 +680,182 @@ class Fetcher:
                     "target %r resolves to a private/loopback address" % host,
                 )
         return clean_url
+
+    # -- budgets / logging / validators ------------------------------------
+    def _budget_reason_and_reserve(self):
+        """Atomically check budgets and consume one request slot.
+
+        Returns the exceeded budget name, or None when the caller reserved a slot.
+        """
+        with self._budget_lock:
+            counts = dict(self._budget_counts)
+            reason = None
+            if self.budget_requests is not None and counts["requests"] >= int(self.budget_requests):
+                reason = "requests"
+            elif self.budget_bytes is not None and counts["bytes"] >= int(self.budget_bytes):
+                reason = "bytes"
+            elif self.budget_tokens is not None and counts["tokens"] >= int(self.budget_tokens):
+                reason = "tokens"
+            elif self.budget_seconds is not None and (time.monotonic() - self._budget_started) > float(self.budget_seconds):
+                reason = "seconds"
+            if reason is None:
+                self._budget_counts["requests"] += 1
+            return reason
+
+    def _budget_reason(self):
+        """Return the exceeded budget name, or None when budget remains (no reserve)."""
+        with self._budget_lock:
+            counts = dict(self._budget_counts)
+        if self.budget_requests is not None and counts["requests"] >= int(self.budget_requests):
+            return "requests"
+        if self.budget_bytes is not None and counts["bytes"] >= int(self.budget_bytes):
+            return "bytes"
+        if self.budget_tokens is not None and counts["tokens"] >= int(self.budget_tokens):
+            return "tokens"
+        if self.budget_seconds is not None:
+            if (time.monotonic() - self._budget_started) > float(self.budget_seconds):
+                return "seconds"
+        return None
+
+    def _budget_spend(self, content_length=0, tokens=0):
+        with self._budget_lock:
+            self._budget_counts["bytes"] += int(content_length or 0)
+            self._budget_counts["tokens"] += int(tokens or 0)
+
+    def _log_event(self, result):
+        if not self.log_jsonl:
+            return
+        try:
+            event = {
+                "ts": _now_iso(),
+                "network": result.get("network"),
+                "url": redact_url(result.get("requested_url") or ""),
+                "status": result.get("status"),
+                "took_ms": result.get("took_ms"),
+                "cached": bool(result.get("cached")),
+                "ok": bool(result.get("ok")),
+                "error_code": result.get("error_code"),
+                "event": "fetch",
+            }
+            line = json.dumps(event) + "\n"
+            with self._log_lock:
+                directory = os.path.dirname(str(self.log_jsonl))
+                if directory:
+                    os.makedirs(directory, exist_ok=True)
+                with open(str(self.log_jsonl), "a", encoding="utf-8") as fh:
+                    fh.write(line)
+        except OSError as exc:
+            import sys
+
+            sys.stderr.write("WARN: cannot write log-jsonl: %s\n" % exc)
+
+    def _validators_for(self, url):
+        if not self.watch:
+            return {}
+        with self._validators_lock:
+            return dict(self._validators.get(url) or {})
+
+    def _store_validators(self, url, resp_headers):
+        if not self.watch:
+            return
+        etag = resp_headers.get("etag") or resp_headers.get("ETag") or ""
+        last = resp_headers.get("last-modified") or resp_headers.get("Last-Modified") or ""
+        if etag or last:
+            with self._validators_lock:
+                self._validators[url] = {"etag": etag, "last_modified": last}
+
+    # -- exit verification / dead ledger -----------------------------------
+    def _verify_exit(self):
+        """Return (exit_ip, is_tor) for this Fetcher, probing at most once."""
+        if "exit_ip" in self._exit_cache:
+            return self._exit_cache["exit_ip"], self._exit_cache["is_tor"]
+        probe = Fetcher(
+            network="tor", tor_proxy=self.tor_proxy, timeout=max(8, self.timeout),
+            retries=0, use_cache=False, max_bytes=65536, isolate=self.isolate,
+        )
+        # Avoid recursion when the probe fetcher itself has tor_verify on.
+        probe.tor_verify = False
+        result = probe._fetch_impl(
+            "http://check.torproject.org/api/ip", _skip_guards=True,
+        )
+        exit_ip, is_tor = None, None
+        if result.get("ok") and isinstance(result.get("text"), str):
+            try:
+                payload = json.loads(result["text"])
+                exit_ip = payload.get("IP")
+                is_tor = bool(payload.get("IsTor"))
+            except (ValueError, AttributeError):
+                pass
+        self._exit_cache["exit_ip"] = exit_ip
+        self._exit_cache["is_tor"] = is_tor
+        return exit_ip, is_tor
+
+    def _apply_exit_verification(self, result, net):
+        """Stamp exit fields when tor_verify is on; fail closed on mismatch."""
+        if not self.tor_verify or net != "tor":
+            return result
+        exit_ip, is_tor = self._verify_exit()
+        result["exit_ip"] = exit_ip
+        result["is_tor"] = is_tor
+        result["exit_verified"] = bool(is_tor)
+        if not is_tor and result.get("ok"):
+            result["ok"] = False
+            result["error"] = "exit verification failed (is_tor=%r, exit_ip=%r)" % (is_tor, exit_ip)
+            result["error_code"] = "ANONYMITY_UNVERIFIED"
+        return result
+
+    def _load_dead(self):
+        if not self.dead_ledger:
+            return {}
+        try:
+            with open(os.path.expanduser(self.dead_ledger), "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+                return data if isinstance(data, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def _save_dead(self, ledger):
+        try:
+            path = os.path.expanduser(self.dead_ledger)
+            directory = os.path.dirname(path)
+            if directory:
+                os.makedirs(directory, exist_ok=True)
+            fd, tmp = _mkstemp(directory or ".")
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    json.dump(ledger, fh, indent=2)
+                os.replace(tmp, path)
+            except BaseException:
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+                raise
+        except OSError:
+            pass
+
+    def _dead_entry(self, host):
+        if not self.dead_ledger or not host:
+            return None
+        with self._dead_lock:
+            return self._load_dead().get(host)
+
+    def _record_dead(self, host, ok):
+        if not self.dead_ledger or not host:
+            return
+        with self._dead_lock:
+            ledger = self._load_dead()
+            entry = dict(ledger.get(host) or {})
+            if ok:
+                entry["consecutive_fails"] = 0
+                entry["suspected_dead"] = False
+                entry["last_ok_at"] = _now_iso()
+            else:
+                entry["consecutive_fails"] = int(entry.get("consecutive_fails") or 0) + 1
+                entry["last_fail_at"] = _now_iso()
+                entry["suspected_dead"] = entry["consecutive_fails"] >= max(1, self.dead_threshold)
+            ledger[host] = entry
+            self._save_dead(ledger)
 
     # -- request loop -----------------------------------------------------
     def _request(self, method, url, network=None, **request_kw):
@@ -743,8 +1052,40 @@ class Fetcher:
 
     # -- public API -------------------------------------------------------
     def fetch(self, url, method="GET", *, data=None, form=True, headers=None, allow_errors=None, keep_raw=False,
-              _skip_guards=False):
+              selector=None, _skip_guards=False):
         """Fetch one URL and return a result dict (never raises for runtime errors)."""
+        # Atomic check+reserve so parallel batches stop at the cap.
+        reason = self._budget_reason_and_reserve()
+        if reason is not None:
+            # Label follows the resolved network for the requested URL.
+            try:
+                clean_tmp = self._validate_target(url)
+                label_tmp = NETWORK_LABEL[self._network_for(clean_tmp)]
+                req_url = clean_tmp
+            except FetchError:
+                safe_tmp = redact_url(url) if isinstance(url, str) else url
+                label_tmp = NETWORK_LABEL.get(self.network, self.network)
+                req_url = safe_tmp
+            result = error_result(
+                "BUDGET", "budget exhausted (%s)" % reason,
+                requested_url=req_url, network=label_tmp,
+            )
+            result["budget_exhausted"] = True
+            self._log_event(result)
+            return result
+        result = self._fetch_impl(
+            url, method=method, data=data, form=form, headers=headers,
+            allow_errors=allow_errors, keep_raw=keep_raw, selector=selector, _skip_guards=_skip_guards,
+        )
+        self._budget_spend(
+            content_length=result.get("content_length") or 0,
+            tokens=result.get("estimated_tokens") or 0,
+        )
+        self._log_event(result)
+        return result
+
+    def _fetch_impl(self, url, method="GET", *, data=None, form=True, headers=None, allow_errors=None, keep_raw=False,
+              selector=None, _skip_guards=False, _interstitial_retried=False):
         t0 = time.monotonic()
         eff_allow_errors = self.allow_errors if allow_errors is None else allow_errors
         try:
@@ -759,6 +1100,21 @@ class Fetcher:
             return result
         net = self._network_for(clean_url)
         label = NETWORK_LABEL[net]
+        # Suspected-dead fast-fail for .onion (ledger; no network burned).
+        eff_selector = selector if selector is not None else self.selector
+        host_clean = host_of(clean_url) or ""
+        if self.dead_ledger and host_clean.endswith(".onion"):
+            dead_entry = self._dead_entry(host_clean)
+            if dead_entry and dead_entry.get("suspected_dead"):
+                result = error_result(
+                    "SUSPECTED_DEAD",
+                    "onion %s suspected dead (%d consecutive failures)" % (
+                        host_clean, dead_entry.get("consecutive_fails", 0)),
+                    requested_url=clean_url, network=label,
+                )
+                result["suspected_dead"] = True
+                result["took_ms"] = int((time.monotonic() - t0) * 1000)
+                return result
 
         if not _skip_guards and self._robots is not None and method == "GET" and data is None:
             if not self._robots.allowed(clean_url):
@@ -771,6 +1127,15 @@ class Fetcher:
 
         request_headers = dict(self.headers)
         request_headers.update(headers or {})
+        # Watch mode: send validators for conditional revalidation.
+        if self.watch:
+            for key, value in self._validators_for(clean_url).items():
+                if not value:
+                    continue
+                if key == "etag":
+                    request_headers.setdefault("If-None-Match", value)
+                elif key == "last_modified":
+                    request_headers.setdefault("If-Modified-Since", value)
         use_cache = (
             self._cache_allowed(request_headers)
             and method == "GET"
@@ -804,6 +1169,8 @@ class Fetcher:
             code, message = req_error
             result = error_result(code, message, requested_url=clean_url, network=label)
             result["took_ms"] = took
+            if host_clean.endswith(".onion"):
+                self._record_dead(host_clean, False)
             return result
 
         body, text, read_error = self._read_and_decode(resp, clean_url, net)
@@ -812,7 +1179,74 @@ class Fetcher:
             read_error["took_ms"] = took
             read_error["final_url"] = final_url
             read_error["content_type"] = resp.headers.get("content-type", "")
+            read_error["response_headers"] = _response_headers(resp.headers)
+            read_error["fetched_at"] = _now_iso()
+            read_error["content_sha256"] = hashlib.sha256(body or b"").hexdigest() if body else ""
+            _oinfo = onion_info(host_of(clean_url) or "")
+            read_error["onion_valid"] = _oinfo.get("valid") if _oinfo.get("is_onion") else None
+            read_error["onion_version"] = _oinfo.get("version") if _oinfo.get("is_onion") else None
+            read_error["validators"] = self._validators_for(clean_url)
             return read_error
+
+        # 304 Not Modified (watch mode): no body to parse, but a successful read.
+        if resp.status_code == 304:
+            resp_headers = _response_headers(resp.headers)
+            self._store_validators(clean_url, resp.headers)
+            validators = self._validators_for(clean_url)
+            oinfo = onion_info(host_of(clean_url) or "")
+            result = Result(
+                ok=True,
+                error="",
+                error_code=None,
+                network=label,
+                requested_url=clean_url,
+                final_url=final_url,
+                status=304,
+                content_type=resp.headers.get("content-type", ""),
+                content_length=0,
+                title="",
+                text_length=0,
+                total_text_length=0,
+                returned_text_length=0,
+                estimated_tokens=0,
+                estimated_tokens_total=0,
+                took_ms=took,
+                links=[],
+                link_count=0,
+                metadata={},
+                needs_renderer=False,
+                payload_extracted=False,
+                items=[],
+                text="",
+                markdown="",
+                headings=[],
+                content_kind="unknown",
+                cached=False,
+                target_tld=_target_tld(clean_url),
+                redirects=len(resp.history),
+                redirect_chain=[redact_url(r.url) for r in resp.history] + [final_url],
+                proxy_used=redact_url(self.proxy_url(net)) or None,
+                fetched_at=_now_iso(),
+                content_sha256="",
+                response_headers=resp_headers,
+                onion_valid=oinfo.get("valid") if oinfo.get("is_onion") else None,
+                onion_version=oinfo.get("version") if oinfo.get("is_onion") else None,
+                not_modified=True,
+                validators=validators,
+                metadata_only=bool(self.metadata_only),
+                budget_exhausted=False,
+                exit_ip=None,
+                is_tor=None,
+                exit_verified=False,
+                suspected_dead=False,
+                extracted=[],
+            )
+            if self.isolate and net == "tor":
+                result["metadata"]["isolated"] = True
+            result = self._apply_exit_verification(result, net)
+            if keep_raw:
+                result["_raw_body"] = RawBody(b"")
+            return result
 
         content_type = resp.headers.get("content-type", "")
         ok = resp.status_code < 400 or eff_allow_errors
@@ -829,12 +1263,29 @@ class Fetcher:
         rendered_markdown = _truncate(kind["markdown"], self.max_chars, "text")
         if kind["kind"] in ("pdf", "image") and not kind["text"]:
             rendered_text = kind["text"]
+        if self.metadata_only:
+            # Keep title/headings/links/metadata; drop bodies to save tokens.
+            rendered_text = ""
+            rendered_markdown = ""
 
         expect_error = self._expect_check(kind["kind"])
         if expect_error:
             # --expect is a contract, not a hint: a mismatch stays a failure even
             # with allow_errors (which is about 4xx/5xx *bodies*).
             ok = False
+        resp_headers = _response_headers(resp.headers)
+        fetched_at = _now_iso()
+        content_sha256 = hashlib.sha256(body or b"").hexdigest()
+        oinfo = onion_info(host_of(clean_url) or "")
+        # Mirror harvesting from response headers (Task 3).
+        onion_hint, i2p_hints = _harvest_mirrors(resp_headers)
+        if onion_hint:
+            kind["metadata"]["onion_location"] = onion_hint
+            kind["metadata"]["mirrors"] = [{"url": onion_hint, "source": "onion-location"}]
+        if i2p_hints:
+            kind["metadata"]["i2p_mirrors"] = [
+                {"url": h, "source": "x-i2p-header"} for h in i2p_hints
+            ]
         result = Result(
             ok=ok,
             error="" if ok else expect_error or "HTTP %d %s" % (resp.status_code, _reason(resp.status_code)),
@@ -867,6 +1318,20 @@ class Fetcher:
             redirects=len(resp.history),
             redirect_chain=[redact_url(r.url) for r in resp.history] + [final_url],
             proxy_used=redact_url(self.proxy_url(net)) or None,
+            fetched_at=fetched_at,
+            content_sha256=content_sha256,
+            response_headers=resp_headers,
+            onion_valid=oinfo.get("valid") if oinfo.get("is_onion") else None,
+            onion_version=oinfo.get("version") if oinfo.get("is_onion") else None,
+            not_modified=False,
+            validators=self._validators_for(clean_url),
+            metadata_only=bool(self.metadata_only),
+            budget_exhausted=False,
+            exit_ip=None,
+            is_tor=None,
+            exit_verified=False,
+            suspected_dead=False,
+            extracted=[],
         )
         if self.isolate and net == "tor":
             result["metadata"]["isolated"] = True
@@ -875,6 +1340,57 @@ class Fetcher:
         if not ok:
             result["error_code"] = result["error_code"] or "HTTP"
             result["error"] = result["error"] or "HTTP %d %s" % (resp.status_code, _reason(resp.status_code))
+        self._store_validators(clean_url, resp.headers)
+        result["validators"] = self._validators_for(clean_url)
+        # v0.5: skip labels, index rows, selector extraction.
+        if kind.get("kind") == "html":
+            from .parse import index_rows, looks_like_index, page_label
+
+            label = page_label(text, kind["text"])
+            if label == "interstitial":
+                result["metadata"]["interstitial"] = True
+                result["metadata"]["skip_reason"] = "interstitial"
+            elif label in ("gated", "challenge"):
+                result["metadata"]["skip_reason"] = label
+            if looks_like_index(len(kind["text"]), len(kind["links"])):
+                result["metadata"]["is_index"] = True
+                result["metadata"]["index_entry_count"] = len(kind["links"])
+                result["metadata"]["index_rows"] = index_rows(kind["links"])
+            # Interstitial: wait briefly and refetch once.
+            if (
+                label == "interstitial"
+                and self.interstitial_retry
+                and not _interstitial_retried
+            ):
+                if self.interstitial_wait > 0:
+                    time.sleep(self.interstitial_wait)
+                retried = self._fetch_impl(
+                    url, method=method, data=data, form=form, headers=headers,
+                    allow_errors=allow_errors, keep_raw=keep_raw,
+                    selector=selector, _skip_guards=_skip_guards,
+                    _interstitial_retried=True,
+                )
+                if retried.get("ok"):
+                    retried["metadata"]["interstitial"] = True
+                    retried["metadata"]["interstitial_retried"] = True
+                    return retried
+            if eff_selector:
+                from .parse import extract_selector
+
+                try:
+                    result["extracted"] = extract_selector(text, eff_selector, base_url=final_url)
+                except ValueError as exc:
+                    bad = error_result("USAGE", str(exc), requested_url=clean_url, network=label)
+                    bad["took_ms"] = took
+                    return bad
+            else:
+                result["extracted"] = []
+        else:
+            result["extracted"] = []
+        # Dead ledger + exit verification (v0.5).
+        if host_clean.endswith(".onion"):
+            self._record_dead(host_clean, bool(result.get("ok")))
+        result = self._apply_exit_verification(result, net)
         self._jar.save(self._session())
         if (
             self._cache_allowed(request_headers)
@@ -882,6 +1398,7 @@ class Fetcher:
             and data is None
             and ok
             and not resp.history
+            and not self.metadata_only
         ):
             self.cache.put(
                 net,
@@ -892,7 +1409,10 @@ class Fetcher:
                 body,
                 headers=dict(resp.headers),
                 context=cache_context,
+                fetched_at=fetched_at,
             )
+            if self.cache_max_mb is not None:
+                self.cache.evict_until_under(self.cache_max_mb)
         if keep_raw:
             result["_raw_body"] = RawBody(body)
         return result
@@ -1003,6 +1523,9 @@ class Fetcher:
         )
         rendered_text = _truncate(kind["text"], self.max_chars, "text")
         rendered_markdown = _truncate(kind["markdown"], self.max_chars, "text")
+        if self.metadata_only:
+            rendered_text = ""
+            rendered_markdown = ""
         status = meta.get("status")
         expect_error = self._expect_check(kind["kind"])
         ok = status is not None and (status < 400 or eff_allow_errors)
@@ -1019,6 +1542,20 @@ class Fetcher:
             error_code = "EXPECT_MISMATCH"
         elif not ok:
             error_code = "HTTP"
+        cached_headers = meta.get("headers")
+        try:
+            resp_headers = {str(k).lower(): str(v) for k, v in dict(cached_headers or {}).items()}
+        except Exception:
+            resp_headers = {}
+        onion_hint, i2p_hints = _harvest_mirrors(resp_headers)
+        if onion_hint:
+            kind["metadata"]["onion_location"] = onion_hint
+            kind["metadata"]["mirrors"] = [{"url": onion_hint, "source": "onion-location"}]
+        if i2p_hints:
+            kind["metadata"]["i2p_mirrors"] = [
+                {"url": h, "source": "x-i2p-header"} for h in i2p_hints
+            ]
+        oinfo = onion_info(host_of(url) or "")
         result = Result(
             ok=ok,
             error=error,
@@ -1051,18 +1588,57 @@ class Fetcher:
             redirects=0,
             redirect_chain=[],
             proxy_used=redact_url(self.proxy_url(net)) or None,
+            fetched_at=meta.get("fetched_at") or _now_iso(),
+            content_sha256=hashlib.sha256(body or b"").hexdigest(),
+            response_headers=resp_headers,
+            onion_valid=oinfo.get("valid") if oinfo.get("is_onion") else None,
+            onion_version=oinfo.get("version") if oinfo.get("is_onion") else None,
+            not_modified=False,
+            validators=self._validators_for(url),
+            metadata_only=bool(self.metadata_only),
+            budget_exhausted=False,
+            exit_ip=None,
+            is_tor=None,
+            exit_verified=False,
+            suspected_dead=False,
+            extracted=[],
         )
+        if kind.get("kind") == "html":
+            from .parse import index_rows, looks_like_index, page_label
+
+            raw_html = body.decode("utf-8", errors="replace")
+            label = page_label(raw_html, kind["text"])
+            if label == "interstitial":
+                result["metadata"]["interstitial"] = True
+                result["metadata"]["skip_reason"] = "interstitial"
+            elif label in ("gated", "challenge"):
+                result["metadata"]["skip_reason"] = label
+            if looks_like_index(len(kind["text"]), len(kind["links"])):
+                result["metadata"]["is_index"] = True
+                result["metadata"]["index_entry_count"] = len(kind["links"])
+                result["metadata"]["index_rows"] = index_rows(kind["links"])
+            if self.selector:
+                from .parse import extract_selector
+
+                try:
+                    result["extracted"] = extract_selector(raw_html, self.selector, base_url=final_url)
+                except ValueError:
+                    result["extracted"] = []
+        result = self._apply_exit_verification(result, net)
         if keep_raw:
             result["_raw_body"] = RawBody(body)
         return result
 
-    def fetch_many(self, urls, concurrency=4, keep_raw=False):
+    def fetch_many(self, urls, concurrency=4, keep_raw=False, **fetch_kwargs):
         """Fetch many URLs with a bounded thread pool. Order preserved."""
         results = [None] * len(urls)
         if concurrency <= 1 or len(urls) <= 1:
-            return [self.fetch(u, keep_raw=keep_raw) for u in urls]
+            return [self.fetch(u, keep_raw=keep_raw, **fetch_kwargs) for u in urls]
         with ThreadPoolExecutor(max_workers=concurrency) as pool:
-            futures = {pool.submit(self.fetch, u, keep_raw=keep_raw): i for i, u in enumerate(urls)}
+            futures = {
+                pool.submit(self.fetch, u, keep_raw=keep_raw, **fetch_kwargs): i
+                for i, u in enumerate(urls)
+            }
             for future in as_completed(futures):
                 idx = futures[future]
                 results[idx] = future.result()
@@ -1144,20 +1720,31 @@ def _apply_format(result, fmt):
     return result
 
 
-def fetch(url, format="text", **kwargs):
+def fetch(url, format="text", method=None, data=None, form=True, headers=None, **kwargs):
     """Fetch a single URL through the default normal network (or override).
 
     ``format`` picks which field is promoted into ``result["text"]``
     (``text``/``markdown``/``raw``/``html``); every field is always present.
     """
     keep_raw = kwargs.pop("keep_raw", True)
-    result = Fetcher(**kwargs).fetch(url, keep_raw=keep_raw)
+    result = Fetcher(**kwargs).fetch(
+        url, method=method or "GET", data=data, form=form, headers=headers,
+        keep_raw=keep_raw,
+    )
     return _apply_format(result, format)
 
 
-def fetch_many(urls, concurrency=4, format="text", **kwargs):
+def fetch_many(urls, concurrency=4, format="text", method=None, data=None, form=True, headers=None, **kwargs):
     """Fetch many URLs, returning results in input order."""
     keep_raw = kwargs.pop("keep_raw", True)
     fetcher = Fetcher(**kwargs)
-    results = fetcher.fetch_many(urls, concurrency=concurrency, keep_raw=keep_raw)
+    fetch_kw = {}
+    if method is not None:
+        fetch_kw["method"] = method
+    if data is not None:
+        fetch_kw["data"] = data
+        fetch_kw["form"] = form
+    if headers is not None:
+        fetch_kw["headers"] = headers
+    results = fetcher.fetch_many(urls, concurrency=concurrency, keep_raw=keep_raw, **fetch_kw)
     return [_apply_format(r, format) for r in results]

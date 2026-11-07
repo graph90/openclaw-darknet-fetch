@@ -225,7 +225,7 @@ class TestCliNew:
         )
         assert p.returncode == 0
         data = json.loads(p.stdout)
-        assert data["version"].startswith("0.3")
+        assert data["version"].startswith("0.")
 
     def test_mcp_help(self):
         import subprocess

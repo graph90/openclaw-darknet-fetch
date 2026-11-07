@@ -160,6 +160,79 @@ def _build_server(network="normal", **defaults):
         return Fetcher(network=selected_network(network), no_private_ip=True).check_proxy()
 
     @mcp.tool()
+    def compare(urls: list, network: Optional[str] = None,
+                concurrency: int = 4, isolate: Optional[bool] = None) -> dict:
+        """Fetch several URLs in parallel and flag whether they agree.
+
+        Returns an availability matrix with per-URL provenance plus
+        ``all_reachable`` / ``all_identical_content`` flags.
+        """
+        from .compare import compare as run_compare
+
+        options = base_kwargs(network=network, isolate=isolate)
+        fetcher_options = {k: v for k, v in options.items() if k != "network"}
+        return run_compare(
+            list(urls), network=selected_network(network),
+            concurrency=concurrency, **fetcher_options,
+        )
+
+    @mcp.tool()
+    def deep_fetch(query: str, top_n: int = 3, network: Optional[str] = None,
+                   backend: str = "auto", search_url: Optional[str] = None,
+                   isolate: Optional[bool] = None) -> dict:
+        """Search a topic and return a sourced markdown brief in one call.
+
+        Searches, fetches the top N hits in parallel, dedupes by content hash,
+        and returns a brief with per-source provenance + token accounting.
+        """
+        from .deep import deep_fetch as run_deep_fetch
+
+        options = base_kwargs(network=network, isolate=isolate)
+        fetcher_options = {k: v for k, v in options.items() if k != "network"}
+        return run_deep_fetch(
+            query, top_n=top_n, network=selected_network(network),
+            backend=backend, search_url=search_url, **fetcher_options,
+        )
+
+    @mcp.tool()
+    def find_mirrors(site: str, network: Optional[str] = None,
+                     include_sponsored: bool = False,
+                     isolate: Optional[bool] = None) -> dict:
+        """Find onion/I2P mirrors of a site (headers + search indexes)."""
+        from .mirrors import find_mirrors as run_mirrors
+
+        options = base_kwargs(network=network, isolate=isolate)
+        fetcher_options = {k: v for k, v in options.items() if k != "network"}
+        return run_mirrors(
+            site, network=selected_network(network),
+            include_sponsored=bool(include_sponsored), **fetcher_options,
+        )
+
+    @mcp.tool()
+    def collect_documents(seed_url: str, network: Optional[str] = None,
+                          isolate: Optional[bool] = None) -> dict:
+        """Bucket a page's document/archive/download links without downloading."""
+        from .documents import collect_documents as run_collect
+
+        options = base_kwargs(network=network, isolate=isolate)
+        fetcher_options = {k: v for k, v in options.items() if k != "network"}
+        return run_collect(
+            seed_url, network=selected_network(network), **fetcher_options,
+        )
+
+    @mcp.tool()
+    def doctor(network: Optional[str] = None, tor_proxy: Optional[str] = None,
+               i2p_proxy: Optional[str] = None) -> dict:
+        """Probe Tor/I2P proxies and report what can be verified."""
+        from .doctor import doctor as run_doctor
+
+        return run_doctor(
+            network=selected_network(network),
+            tor_proxy=tor_proxy, i2p_proxy=i2p_proxy,
+            isolate=True,
+        )
+
+    @mcp.tool()
     def estimate_tokens(text: str) -> dict:
         """Approximate how many tokens a text body will consume."""
         return {"text_length": len(text), "estimated_tokens": estimate_tokens(text)}

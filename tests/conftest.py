@@ -24,6 +24,7 @@ class _State:
     def __init__(self):
         self.retry_hits = 0
         self.slow_hits = 0
+        self.wait_hits = 0
         self.lock = threading.Lock()
 
 
@@ -132,8 +133,54 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, "text/plain; charset=utf-8", b"echo:" + query.encode("utf-8"))
         elif path == "/preview":
             self._send(200, "text/html; charset=utf-8", b"<html><head><title>Pr</title></head><body><h1>Sky</h1></body></html>")
+        elif path == "/onion-location":
+            onion = "http://" + "a" * 56 + ".onion/"
+            self._send(200, "text/html; charset=utf-8",
+                       b"<html><head><title>Onion Mirror</title></head><body><p>mirror</p></body></html>",
+                       extra={"Onion-Location": onion})
+        elif path == "/links":
+            body = (
+                b'<html><head><title>Links</title></head><body><h1>Links</h1>'
+                b'<p><a href="/page">page</a></p>'
+                b'<p><a href="/paper.pdf">doc</a></p>'
+                b'<p><a href="/bundle.zip">arch</a></p>'
+                b'<p><a href="/img.png">img</a></p>'
+                b"</body></html>"
+            )
+            self._send(200, "text/html; charset=utf-8", body)
+        elif path == "/etag":
+            if self.headers.get("If-None-Match") == '"v1"':
+                self.send_response(304)
+                self.send_header("ETag", '"v1"')
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            self._send(200, "text/plain; charset=utf-8", b"etag-body", extra={"ETag": '"v1"'})
+        elif path == "/header-echo":
+            out = json.dumps({"headers": dict(self.headers), "query": query}).encode("utf-8")
+            self._send(200, "application/json; charset=utf-8", out)
+        elif path == "/please-wait":
+            with self.server.state.lock:
+                self.server.state.wait_hits += 1
+                hits = self.server.state.wait_hits
+            if hits < 2:
+                self._send(200, "text/html; charset=utf-8",
+                           b"<html><head><title>Wait</title></head><body><p>Please wait...</p></body></html>")
+            else:
+                self._send(200, "text/html; charset=utf-8",
+                           b"<html><head><title>Real</title></head><body><h1>Real Page</h1><p>Full article body here with enough text.</p></body></html>")
+        elif path == "/index":
+            rows = b"".join(b'<div class="entry"><a href="/entry%d">Entry %d</a></div>' % (i, i) for i in range(10))
+            self._send(200, "text/html; charset=utf-8",
+                       b"<html><head><title>Directory</title></head><body>" + rows + b"</body></html>")
+        elif path == "/gated":
+            self._send(200, "text/html; charset=utf-8",
+                       b"<html><head><title>Gated</title></head><body><p>Members only. Please log in to read.</p></body></html>")
         else:
             self._send(404, "text/plain; charset=utf-8", b"no route")
+
+    def do_HEAD(self):
+        self._send(200, "text/plain; charset=utf-8", b"", extra={})
 
     def do_POST(self):
         path = self.path.split("?")[0]

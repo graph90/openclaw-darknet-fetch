@@ -93,6 +93,53 @@ def build_parser():
     parser.add_argument("--verbose", "-v", action="store_true", help="Log per-request details to stderr.")
     parser.add_argument("--version", action="version", version="%(prog)s " + __version__)
 
+    # -- HTTP methods & headers (Task 5) -----------------------------------
+    parser.add_argument("--method", metavar="METHOD",
+                        choices=("GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"),
+                        help="HTTP method for fetch mode (default GET).")
+    parser.add_argument("--data", metavar="STRING", help="Raw request body (sent as-is).")
+    parser.add_argument("--form", metavar="STRING", help="Form-encoded body, e.g. 'k=v&k2=v2'.")
+    parser.add_argument("--json-body", dest="json_body", metavar="STRING",
+                        help="JSON request body, e.g. '{\"k\":\"v\"}'.")
+    parser.add_argument("--header", metavar="'K: V'", action="append", default=[],
+                        help="Extra request header; repeat for multiple headers.")
+
+    # -- v0.4 additions ----------------------------------------------------
+    parser.add_argument("--strict-onion", action="store_true",
+                        help="Reject .onion hosts that fail v3 checksum validation.")
+    parser.add_argument("--metadata-only", action="store_true",
+                        help="Return only title/headings/links/metadata (no body text).")
+    parser.add_argument("--budget-seconds", type=float, default=None, metavar="SEC",
+                        help="Global wall-clock budget for this invocation.")
+    parser.add_argument("--budget-bytes", type=int, default=None, metavar="N",
+                        help="Global body-byte budget across URLs.")
+    parser.add_argument("--budget-requests", type=int, default=None, metavar="N",
+                        help="Global request-count budget across URLs.")
+    parser.add_argument("--budget-tokens", type=int, default=None, metavar="N",
+                        help="Global estimated-token budget across URLs.")
+    parser.add_argument("--log-jsonl", metavar="FILE",
+                        help="Append one JSON event per request to FILE.")
+    parser.add_argument("--watch", action="store_true",
+                        help="Remember ETag/Last-Modified and send conditional requests.")
+    parser.add_argument("--cache-max-mb", type=float, default=None, metavar="MB",
+                        help="Evict cache oldest-first above MB.")
+    parser.add_argument("--cache-stats", action="store_true",
+                        help="Print cache stats as JSON and exit.")
+
+    # -- v0.5 additions ----------------------------------------------------
+    parser.add_argument("--tor-doctor", action="store_true",
+                        help="Probe Tor/I2P proxies and report what can be verified.")
+    parser.add_argument("--tor-verify", action="store_true",
+                        help="Verify Tor exit (is_tor) on the first fetch; fail closed otherwise.")
+    parser.add_argument("--config", metavar="PATH", dest="config_path",
+                        help="Load defaults from a config.toml file.")
+    parser.add_argument("--selector", metavar="CSS",
+                        help="Extract matches for a CSS selector into result['extracted'].")
+    parser.add_argument("--collect-documents", action="store_true",
+                        help="Bucket the seed page's document/archive/download links as JSON.")
+    parser.add_argument("--dead-ledger", metavar="PATH",
+                        help="Enable the suspected-dead onion ledger at PATH.")
+
     # -- discovery & workflow ----------------------------------------------
     parser.add_argument("--search", metavar="QUERY",
                         help="Search (Tor66 / Marginalia / DuckDuckGo / Ahmia / SearXNG) "
@@ -169,7 +216,7 @@ def _mcp_command(argv):
 
 
 def _env_report(args):
-    opts = config.resolve({})
+    opts = config.resolve({}, config_path=getattr(args, "config_path", None))
     opts["version"] = __version__
     opts["default_cache_dir"] = config.default_cache_dir()
     opts["networks"] = ["normal", "tor", "i2p"]
@@ -180,6 +227,27 @@ def _env_report(args):
 
     sys.stdout.write(_json.dumps(opts, indent=2) + "\n")
     return 0
+
+
+def _tor_doctor_report(args, network):
+    from .doctor import doctor
+
+    result = doctor(network=network, tor_proxy=args.tor_proxy, i2p_proxy=args.i2p_proxy,
+                    isolate=bool(args.isolate) if args.isolate is not None else True)
+    fmt = _resolve_format(args)
+    if fmt in ("json", "jsonl"):
+        import json as _json
+
+        sys.stdout.write(_json.dumps(result, indent=2) + "\n")
+    else:
+        sys.stdout.write("DOCTOR: network=%s ok=%s isolation=%s\n" % (
+            result["network"], result["ok"], result["isolation"]))
+        for check in result.get("checks", []):
+            sys.stdout.write("- %s ok=%s %s\n" % (check["name"], check["ok"], check["detail"]))
+        sys.stdout.write("torrc hints:\n")
+        for hint in result.get("torrc_hints", []):
+            sys.stdout.write("  %s\n" % hint)
+    return 0 if result.get("ok") else 2
 
 
 def main(argv=None):
@@ -194,16 +262,40 @@ def main(argv=None):
     if args.env_report:
         return _env_report(args)
 
+    if getattr(args, "cache_stats", False):
+        import json as _json
+
+        sys.stdout.write(_json.dumps(TtlCache().stats(), indent=2) + "\n")
+        return 0
+
     if args.flush_cache:
         TtlCache().flush()
         sys.stderr.write("cache flushed\n")
         return 0
+
+    # Determine network early so --tor-doctor / --check-proxy work without a URL.
+    # Doctor defaults to auto (probe both daemons) when no network flag is given.
+    if args.normal is not None:
+        network = "normal"
+    elif args.tor is not None:
+        network = "tor"
+    elif args.i2p is not None:
+        network = "i2p"
+    elif args.auto is not None:
+        network = "auto"
+    else:
+        network = "auto" if getattr(args, "tor_doctor", False) else "normal"
+
+    if getattr(args, "tor_doctor", False):
+        return _tor_doctor_report(args, network)
 
     mode = "fetch"
     if args.search is not None:
         mode = "search"
     if args.follow is not None:
         mode = "crawl"
+    if getattr(args, "collect_documents", False):
+        mode = "documents"
 
     if args.normal is not None:
         network = "normal"
@@ -245,6 +337,29 @@ def main(argv=None):
         except ValueError:
             parser.error("--follow expects an integer depth")
 
+    # -- Task 5: body flags are mutually exclusive ---------------------------
+    bodies = [n for n, v in (("data", args.data), ("form", args.form), ("json-body", args.json_body)) if v is not None]
+    if len(bodies) > 1:
+        parser.error("--data, --form and --json-body are mutually exclusive")
+    # -- Task 5: --header 'K: V' (repeatable) --------------------------------
+    request_headers = {}
+    for entry in (args.header or []):
+        if ":" not in entry:
+            parser.error("--header expects 'K: V' (got %r)" % entry)
+        key, value = entry.split(":", 1)
+        key = key.strip()
+        value = value.strip()
+        if not key:
+            parser.error("--header expects 'K: V' (got %r)" % entry)
+        request_headers[key] = value
+    # -- budget sanity -------------------------------------------------------
+    for name, value in (("budget-seconds", args.budget_seconds), ("budget-bytes", args.budget_bytes),
+                        ("budget-requests", args.budget_requests), ("budget-tokens", args.budget_tokens)):
+        if value is not None and value <= 0:
+            parser.error("--%s must be greater than zero" % name)
+    if getattr(args, "cache_max_mb", None) is not None and args.cache_max_mb <= 0:
+        parser.error("--cache-max-mb must be greater than zero")
+
     fmt = _resolve_format(args)
     json_mode = fmt in ("json", "jsonl")
 
@@ -259,6 +374,7 @@ def main(argv=None):
         cookie_jar=args.cookie_jar,
         use_cache=not args.no_cache,
         cache_ttl=args.cache_ttl,
+        cache_max_mb=getattr(args, "cache_max_mb", None),
         max_bytes=args.max_bytes,
         max_chars=args.max_chars,
         max_links=args.max_links,
@@ -269,6 +385,18 @@ def main(argv=None):
         no_private_ip=args.no_private_ip,
         expect=args.expect,
         isolate=args.isolate,
+        strict_onion=getattr(args, "strict_onion", False),
+        metadata_only=getattr(args, "metadata_only", False),
+        budget_seconds=args.budget_seconds,
+        budget_bytes=args.budget_bytes,
+        budget_requests=args.budget_requests,
+        budget_tokens=args.budget_tokens,
+        log_jsonl=args.log_jsonl,
+        watch=getattr(args, "watch", False),
+        tor_verify=getattr(args, "tor_verify", False),
+        config_path=getattr(args, "config_path", None),
+        selector=getattr(args, "selector", None),
+        dead_ledger=getattr(args, "dead_ledger", None),
     )
 
     if args.check_proxy:
@@ -310,11 +438,39 @@ def main(argv=None):
             parser.error("--follow requires a seed URL via -n/-t/-i/-a")
         return _run_crawl(args, fetcher, network, urls[0], fmt, json_mode)
 
+    if mode == "documents":
+        if not urls:
+            parser.error("--collect-documents requires a seed URL via -n/-t/-i/-a")
+        return _run_documents(args, fetcher, network, urls[0], fmt, json_mode)
+
+    # Resolve --method/--data/--form/--json-body/--header into fetch kwargs.
+    method = (args.method or "GET").upper()
+    fetch_data = None
+    fetch_form = True
+    if args.data is not None:
+        fetch_data = args.data
+    elif args.form is not None:
+        from urllib.parse import parse_qsl
+
+        fetch_data = dict(parse_qsl(args.form, keep_blank_values=True))
+        fetch_form = True
+    elif args.json_body is not None:
+        fetch_data = args.json_body
+        fetch_form = False
+    fetch_kw = {"method": method, "headers": request_headers or None}
+    if fetch_data is not None:
+        fetch_kw["data"] = fetch_data
+        fetch_kw["form"] = fetch_form
+
     if len(urls) == 1:
-        results = [fetcher.fetch(urls[0], keep_raw=keep_raw)]
+        results = [fetcher.fetch(urls[0], keep_raw=keep_raw, **fetch_kw)]
     else:
-        results = fetcher.fetch_many(urls, concurrency=args.concurrency or config.DEFAULT_CONCURRENCY,
-                                     keep_raw=keep_raw)
+        results = fetcher.fetch_many(
+            urls,
+            concurrency=args.concurrency or config.DEFAULT_CONCURRENCY,
+            keep_raw=keep_raw,
+            **fetch_kw,
+        )
 
     render(results, fmt=fmt)
     if args.save_raw:
@@ -461,8 +617,24 @@ def _emit_json(payload, fmt, json_mode, search_only=False):
                 page.get("depth"), page.get("requested_url", ""), page.get("ok"),
                 page.get("status"), page.get("content_kind"), page.get("cached"),
                 page.get("estimated_tokens")))
+    elif isinstance(payload, dict) and "documents" in payload:
+        print("DOCUMENTS SEED: %s" % payload.get("seed_url", ""))
+        print("TOTAL: %s (document=%s archive=%s download=%s)" % (
+            payload.get("total"), len(payload.get("documents", [])),
+            len(payload.get("archive", [])), len(payload.get("download", []))))
+        for bucket in ("documents", "archive", "download"):
+            for item in payload.get(bucket, []):
+                print("- [%s] %s" % (bucket, item.get("url", "")))
     else:
         print(_json.dumps(payload, indent=2, ensure_ascii=False))
+
+
+def _run_documents(args, fetcher, network, seed, fmt, json_mode):
+    from .documents import collect_documents
+
+    result = collect_documents(seed, network=network, fetcher=fetcher)
+    _emit_json(result, fmt, json_mode)
+    return 0 if result.ok else exit_code_for(result.get("error_code") or "APP_ERROR")
 
 
 if __name__ == "__main__":

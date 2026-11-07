@@ -37,6 +37,12 @@ def human_header(result):
     lines.append("TOTAL_TEXT_LENGTH: %s" % result.get("total_text_length", ""))
     lines.append("RETURNED_TEXT: %s" % result.get("returned_text_length", ""))
     lines.append("LINK_COUNT: %s" % result.get("link_count", ""))
+    if result.get("fetched_at"):
+        lines.append("FETCHED_AT: %s" % result["fetched_at"])
+    if result.get("content_sha256"):
+        lines.append("CONTENT_SHA256: %s" % result["content_sha256"])
+    if result.get("not_modified"):
+        lines.append("NOT_MODIFIED: true")
     if result.get("cached"):
         lines.append("CACHED: true")
     if result.get("took_ms") is not None:

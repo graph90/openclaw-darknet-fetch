@@ -12,9 +12,11 @@ EXIT_CODES = {
     "USAGE": 1,
     "SCHEME_BLOCKED": 1,
     "NETWORK_MISMATCH": 1,
+    "ONION_INVALID": 1,
     "PROXY_DOWN": 2,
     "TIMEOUT": 3,
     "CONNECTION": 4,
+    "SUSPECTED_DEAD": 4,
     "HTTP": 5,
     "REQUEST": 5,
     "EXPECT_MISMATCH": 5,
@@ -23,6 +25,7 @@ EXIT_CODES = {
     "BUDGET": 6,
     "HOST_BLOCKED": 6,
     "ROBOTS_BLOCKED": 6,
+    "ANONYMITY_UNVERIFIED": 6,
 }
 
 DEFAULT_EXIT_CODE = 6
@@ -86,6 +89,23 @@ _READ_SHAPE = {
     "redirects": 0,
     "redirect_chain": [],
     "proxy_used": None,
+    # Provenance (Task 1), onion (Task 2), headers/mirrors (Task 3),
+    # watch/budget (Tasks 6+8), metadata-only (Task 4).
+    "fetched_at": "",
+    "content_sha256": "",
+    "response_headers": {},
+    "onion_valid": None,
+    "onion_version": None,
+    "not_modified": False,
+    "validators": {},
+    "metadata_only": False,
+    "budget_exhausted": False,
+    # v0.5: exit verification, suspected-dead ledger, selector extraction.
+    "exit_ip": None,
+    "is_tor": None,
+    "exit_verified": False,
+    "suspected_dead": False,
+    "extracted": [],
 }
 
 
@@ -100,6 +120,8 @@ def _tld_for(url):
 
 def error_result(error_code, message, requested_url=None, network=None, **extra):
     """Build an ``ok: false`` result carrying the full canonical read shape."""
+    from datetime import datetime, timezone
+
     result = Result(ok=False, error=message, error_code=error_code, network=network)
     for key, value in _READ_SHAPE.items():
         result[key] = list(value) if isinstance(value, list) else (
@@ -107,5 +129,7 @@ def error_result(error_code, message, requested_url=None, network=None, **extra)
         )
     result["requested_url"] = requested_url
     result["target_tld"] = _tld_for(requested_url)
+    if not result.get("fetched_at"):
+        result["fetched_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     result.update(extra)
     return result
